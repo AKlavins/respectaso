@@ -100,6 +100,11 @@ CSRF_TRUSTED_ORIGINS = [
     "http://respectaso.private:9090",
 ]
 
+# Additional trusted origins for production (e.g. https://aso.klavins.dev)
+_extra_csrf_origins = os.environ.get("CSRF_TRUSTED_ORIGINS", "")
+if _extra_csrf_origins:
+    CSRF_TRUSTED_ORIGINS += [o.strip() for o in _extra_csrf_origins.split(",") if o.strip()]
+
 # Native app: allow any localhost port (Gunicorn binds to a random port)
 if IS_NATIVE_APP:
     import re
