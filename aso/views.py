@@ -32,6 +32,10 @@ logger = logging.getLogger(__name__)
 # app_rank is now persisted directly on SearchResult during search/refresh.
 # No need for a helper to find rank in stored competitors.
 
+# Allowed page sizes for the dashboard history table.
+HISTORY_PER_PAGE_CHOICES = (25, 50, 100, 200)
+HISTORY_PER_PAGE_DEFAULT = 25
+
 
 def methodology_view(request):
     """Our Methodology page — explains how RespectASO works."""
@@ -263,14 +267,19 @@ def dashboard_view(request):
         keyword_qs = keyword_qs.filter(app_id=app_id)
     keyword_count = keyword_qs.count()
 
-    # Pagination (25 per page)
+    # Pagination
     page = request.GET.get("page", "1")
     try:
         page = max(1, int(page))
     except (ValueError, TypeError):
         page = 1
 
-    per_page = 25
+    try:
+        per_page = int(request.GET.get("per_page", HISTORY_PER_PAGE_DEFAULT))
+    except (ValueError, TypeError):
+        per_page = HISTORY_PER_PAGE_DEFAULT
+    if per_page not in HISTORY_PER_PAGE_CHOICES:
+        per_page = HISTORY_PER_PAGE_DEFAULT
     total_count = len(sorted_results) if sorted_results is not None else results_qs.count()
     total_pages = max(1, (total_count + per_page - 1) // per_page)
     page = min(page, total_pages)
@@ -280,34 +289,48 @@ def dashboard_view(request):
     else:
         history_results = list(results_qs[start : start + per_page])
 
-    # Annotate each result with trend data (previous result comparison)
-    for result in history_results:
-        prev = (
+    # Annotate each result with trend data (previous result comparison).
+    # Fetched as one superset query for the page instead of two queries per
+    # row — the __in filters may match extra keyword/country combinations,
+    # but grouping keys are exact so the extras are simply unused.
+    from collections import defaultdict
+
+    history_by_pair = defaultdict(list)
+    if history_results:
+        snapshot_rows = (
             SearchResult.objects
             .filter(
-                keyword_id=result.keyword_id,
-                country=result.country,
-                searched_at__lt=result.searched_at,
+                keyword_id__in={r.keyword_id for r in history_results},
+                country__in={r.country for r in history_results},
             )
             .order_by("-searched_at")
-            .first()
+            .values(
+                "keyword_id", "country", "searched_at",
+                "popularity_score", "difficulty_score", "app_rank",
+            )
         )
-        history_count = SearchResult.objects.filter(
-            keyword_id=result.keyword_id, country=result.country
-        ).count()
-        result.has_history = history_count > 1
+        for row in snapshot_rows:
+            history_by_pair[(row["keyword_id"], row["country"])].append(row)
+
+    for result in history_results:
+        pair_rows = history_by_pair[(result.keyword_id, result.country)]
+        prev = next(
+            (row for row in pair_rows if row["searched_at"] < result.searched_at),
+            None,
+        )
+        result.has_history = len(pair_rows) > 1
         if prev:
-            result.prev_popularity = prev.popularity_score
-            result.prev_difficulty = prev.difficulty_score
-            result.prev_rank = prev.app_rank
+            result.prev_popularity = prev["popularity_score"]
+            result.prev_difficulty = prev["difficulty_score"]
+            result.prev_rank = prev["app_rank"]
             # Calculate deltas
-            if result.popularity_score is not None and prev.popularity_score is not None:
-                result.popularity_delta = result.popularity_score - prev.popularity_score
+            if result.popularity_score is not None and prev["popularity_score"] is not None:
+                result.popularity_delta = result.popularity_score - prev["popularity_score"]
             else:
                 result.popularity_delta = None
-            result.difficulty_delta = result.difficulty_score - prev.difficulty_score
-            if result.app_rank is not None and prev.app_rank is not None:
-                result.rank_delta = prev.app_rank - result.app_rank  # Lower rank = better = positive delta
+            result.difficulty_delta = result.difficulty_score - prev["difficulty_score"]
+            if result.app_rank is not None and prev["app_rank"] is not None:
+                result.rank_delta = prev["app_rank"] - result.app_rank  # Lower rank = better = positive delta
             else:
                 result.rank_delta = None
         else:
@@ -348,6 +371,8 @@ def dashboard_view(request):
             "available_countries": list(available_countries),
             "show_rank": show_rank,
             "page": page,
+            "per_page": per_page,
+            "per_page_choices": HISTORY_PER_PAGE_CHOICES,
             "total_pages": total_pages,
             "total_count": total_count,
             "total_unfiltered_count": total_unfiltered_count,
@@ -970,33 +995,95 @@ def keyword_delete_view(request, keyword_id):
     return JsonResponse({"success": True})
 
 
+def _delete_tracking_entries(pairs):
+    """Delete the Search History rows identified by (keyword_id, country) pairs.
+
+    Each dashboard row represents a keyword tracked in a country, so for every
+    pair we drop EVERY SearchResult snapshot, not just the latest one. Deleting
+    only the latest snapshot would silently resurrect the previous one on
+    reload, making the click feel like a no-op.
+
+    The pair is the stable row identity — snapshot ids churn because
+    SearchResult.upsert_today replaces today's snapshot on refresh, so callers
+    must not identify rows by result id when the reference can outlive a
+    refresh (e.g. the dashboard's cross-page selection).
+
+    Keywords left with no results in any country are cleaned up to avoid
+    orphans. Pairs that no longer exist are skipped. Returns the number of
+    tracking entries (dashboard rows) deleted.
+    """
+    from django.db.models import Q
+
+    requested = set(pairs)
+    if not requested:
+        return 0
+
+    pair_filter = Q()
+    for keyword_id, country in requested:
+        pair_filter |= Q(keyword_id=keyword_id, country=country)
+
+    existing = set(SearchResult.objects.filter(pair_filter).values_list("keyword_id", "country"))
+    if not existing:
+        return 0
+
+    SearchResult.objects.filter(pair_filter).delete()
+
+    Keyword.objects.filter(
+        id__in={keyword_id for keyword_id, _ in existing}, results__isnull=True
+    ).delete()
+
+    return len(existing)
+
+
 @require_POST
 def result_delete_view(request, result_id):
-    """Remove a Search History row entry — i.e., all snapshots of a (keyword, country) pair.
+    """Remove a single Search History row — all snapshots of its (keyword, country) pair.
 
-    The row passed to this endpoint identifies which (keyword, country) pair the
-    user is removing; we then drop EVERY SearchResult for that pair, not just the
-    latest snapshot. This matches the user's mental model — each row in the
-    History table represents a keyword tracked in a country, and the delete
-    button is expected to remove that tracking entry entirely. Deleting only
-    the latest snapshot would silently resurrect the previous one on reload,
-    making the click feel like a no-op.
-
-    If the parent keyword has no remaining results across any country, the
-    keyword row itself is cleaned up to avoid orphans.
+    See _delete_tracking_entries for the deletion semantics.
     """
     result = get_object_or_404(SearchResult, id=result_id)
-    keyword = result.keyword
-    country = result.country
-
-    # Remove every snapshot for this keyword in this country (not just `result`).
-    SearchResult.objects.filter(keyword_id=keyword.id, country=country).delete()
-
-    # If the keyword no longer has any results in any country, clean it up.
-    if not keyword.results.exists():
-        keyword.delete()
-
+    _delete_tracking_entries([(result.keyword_id, result.country)])
     return JsonResponse({"success": True})
+
+
+@require_POST
+def results_bulk_delete_view(request):
+    """
+    Delete the selected Search History rows.
+
+    POST body: {"entries": [{"keyword_id": int, "country": str}, ...]}
+
+    Entries whose (keyword, country) pair no longer exists (e.g. removed by a
+    concurrent action) are skipped, so the endpoint is idempotent; "deleted"
+    reflects the tracking entries actually removed.
+    """
+    try:
+        body = json.loads(request.body)
+        entries = body.get("entries")
+        if not isinstance(entries, list) or not entries:
+            raise ValueError
+        pairs = []
+        for entry in entries:
+            keyword_id = entry.get("keyword_id") if isinstance(entry, dict) else None
+            country = entry.get("country") if isinstance(entry, dict) else None
+            if not isinstance(keyword_id, int) or not isinstance(country, str) or not country:
+                raise ValueError
+            pairs.append((keyword_id, country))
+    except (ValueError, AttributeError, json.JSONDecodeError):
+        return JsonResponse(
+            {
+                "success": False,
+                "error": "entries must be a non-empty list of {keyword_id, country} objects.",
+            },
+            status=400,
+        )
+
+    from django.db import transaction
+
+    with transaction.atomic():
+        deleted = _delete_tracking_entries(pairs)
+
+    return JsonResponse({"success": True, "deleted": deleted})
 
 
 @require_POST
