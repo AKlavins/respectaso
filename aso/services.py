@@ -16,9 +16,20 @@ import logging
 import math
 import re
 import time
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from typing import ClassVar
 
 import requests
+
+from aso import countries
+
+# The rating volume curve lives in aso/strength.py with every other factor
+# curve, shared by difficulty (the field) and the opportunity score (your
+# app). rating_volume_score stays importable from here.
+from .strength import volume_score as rating_volume_score
+from .throttle import BASE_DELAY, AdaptiveITunesRateLimiter
+from .words import tokenize_words
 
 logger = logging.getLogger(__name__)
 
@@ -29,26 +40,52 @@ logger = logging.getLogger(__name__)
 
 
 class ITunesAPIError(Exception):
-    """Base class for App Store data retrieval errors."""
-    pass
+    """Base class for App Store data retrieval errors: Apple could not be
+    reached or is busy. Never "Apple has no such app": a lookup says that by
+    returning None."""
 
 
 class SearchAPIUnavailableError(ITunesAPIError):
-    """Both primary (iTunes API) and fallback (SSR) search are down."""
-    pass
+    """Apple's App Store could not be reached, did not answer in time,
+    answered with an error or sent an answer that could not be read. For a
+    search: both the iTunes API and the App Store page (SSR) failed."""
+
+
+# What a person reads when Apple's App Store does not answer: what happened
+# and what to do, never which of Apple's services failed (the owner's rule:
+# screens show value, not mechanics). The logs keep the detail.
+APP_STORE_UNAVAILABLE = "Apple's App Store is not answering right now. Try again in a few minutes."
+
+
+# Why a request was turned away when Apple said it is busy: the reason a failed
+# run's report gives (aso_pro/run_failures.py). The logs keep the status.
+APP_STORE_BUSY = "Apple's App Store asked RespectASO to wait before asking again."
+
+# What a person, or an assistant over MCP, reads when Apple says it is busy:
+# the twin of APP_STORE_UNAVAILABLE, with the same next step.
+APP_STORE_BUSY_NOW = "Apple's App Store is busy right now. Try again in a few minutes."
 
 
 class ITunesRateLimited(ITunesAPIError):
-    """The iTunes API returned a rate-limit signal (429 or 503 with Retry-After).
+    """The iTunes API returned a rate-limit signal (429 or 503 with Retry-After;
+    the Lookup also answers a burst with 403, LOOKUP_BUSY_STATUSES).
 
     `retry_after` is the server-suggested wait in seconds, or None if the
     server didn't include the header. Runners feed this into the adaptive
     rate limiter so the next call waits at least this long before retrying.
     """
 
-    def __init__(self, message: str = "iTunes API rate-limited", retry_after: float | None = None):
+    def __init__(self, message: str = APP_STORE_BUSY, retry_after: float | None = None):
         super().__init__(message)
         self.retry_after = retry_after
+
+
+# The statuses with which Apple's Lookup says it is busy: it answers a burst
+# with 403 as well as 429 and 503 (docs/development/COUNTRY_COVERAGE_PLAN.md).
+LOOKUP_BUSY_STATUSES = (403, 429, 503)
+# A lookup a background run depends on is asked up to this many times while
+# Apple cannot be reached or is busy, paced by aso/throttle.py's limiter.
+LOOKUP_ATTEMPTS = 3
 
 
 _FINANCE_INTENT_TOKENS = {
@@ -97,10 +134,10 @@ _TOKEN_NORMALIZATION = {
 def _tokenize(text: str) -> list[str]:
     r"""Tokenize into lowercase words for robust title matching.
 
-    Uses ``[^\W_]+`` (Unicode-aware \w minus underscore) so accented
-    characters like é, ü, ñ are preserved as part of the token.
+    Words as everywhere else in RespectASO (aso/words.py): accents, other
+    scripts and their combining marks stay part of the token.
     """
-    raw_tokens = re.findall(r"[^\W_]+", (text or "").lower())
+    raw_tokens = tokenize_words(text)
     return [_TOKEN_NORMALIZATION.get(tok, tok) for tok in raw_tokens]
 
 
@@ -112,20 +149,47 @@ def _has_finance_context(title_tokens: set[str], genre: str) -> bool:
     genre_lower = (genre or "").lower()
     if "finance" in genre_lower:
         return True
-    if title_tokens & _FINANCE_STRONG_CONTEXT_TOKENS:
-        return True
-    return False
+    return bool(title_tokens & _FINANCE_STRONG_CONTEXT_TOKENS)
+
+
+def compound_form(tokens: list[str]) -> str:
+    """Run-together spelling of a multi-word keyword: "scroll less" -> "scrollless".
+
+    Apple matches "ScrollLess" and "Scroll Less" the same way, and a
+    developer reading the results list sees the same keyword in both, so
+    a title that runs the words together counts as using the exact
+    phrase. Single-word keywords have no compound form (empty string).
+    Shared with the title highlighter (aso_tags.highlight_keyword) so the
+    list and the scores agree on what "in the title" means.
+    """
+    return "".join(tokens) if len(tokens) > 1 else ""
+
+
+def _has_compound_form(kw_tokens: list[str], title_tokens: list[str]) -> bool:
+    """True when a title token starts with the keyword's run-together form.
+
+    Anchored to the start of a token so "smartapp" never matches "art app",
+    while "scrolllessapp" still matches "scroll less".
+    """
+    compound = compound_form(kw_tokens)
+    return bool(compound) and any(
+        tok.startswith(compound) for tok in title_tokens
+    )
 
 
 def _keyword_title_evidence(keyword: str, title: str, genre: str = "") -> dict[str, float | bool]:
     """
     Match hierarchy: exact phrase > all words(any order) > partial overlap(weak).
 
+    The exact-phrase tier also accepts the run-together spelling of the
+    keyword ("ScrollLess" for "scroll less"), see compound_form().
+
     Returns a normalized evidence score in [0, 1] plus match flags.
     """
     kw = (keyword or "").lower().strip()
     title_lower = (title or "").lower()
-    kw_tokens = set(_tokenize(kw))
+    kw_token_list = _tokenize(kw)
+    kw_tokens = set(kw_token_list)
     title_tokens_list = _tokenize(title_lower)
     title_tokens = set(title_tokens_list)
 
@@ -138,7 +202,9 @@ def _keyword_title_evidence(keyword: str, title: str, genre: str = "") -> dict[s
             "evidence": 0.0,
         }
 
-    exact_phrase = bool(kw and kw in title_lower)
+    exact_phrase = bool(kw and kw in title_lower) or _has_compound_form(
+        kw_token_list, title_tokens_list
+    )
     all_words = all(tok in title_tokens for tok in kw_tokens)
     overlap = len(kw_tokens & title_tokens) / len(kw_tokens)
 
@@ -261,6 +327,48 @@ def _is_brand_keyword(
 # --------------------------------------------------------------------------- #
 
 
+# Leader strength, 0-30, from the strongest leading app's rating count: log
+# interpolation between the points, so no count is a step.
+_LEADER_BANDS = [
+    (10, 1),
+    (100, 5),
+    (1_000, 10),
+    (10_000, 17),
+    (100_000, 24),
+    (1_000_000, 30),
+]
+
+
+def _leader_band_score(max_reviews: float) -> float:
+    if max_reviews <= 0:
+        return 0
+    if max_reviews >= 1_000_000:
+        return 30
+    for i, (threshold, score) in enumerate(_LEADER_BANDS):
+        if max_reviews < threshold:
+            if i == 0:
+                return (max_reviews / threshold) * score
+            prev_t, prev_s = _LEADER_BANDS[i - 1]
+            ratio = math.log(max_reviews / prev_t) / math.log(threshold / prev_t)
+            return prev_s + ratio * (score - prev_s)
+    return 30
+
+
+# How many positions the leader gate takes to fade, around the middle of the
+# results. The top app always counts fully; at 25 results #13 counts half,
+# #16 a quarter and #25 almost nothing.
+LEADER_GATE_WIDTH = 3.0
+
+
+def _leader_gate(index: int, n: int) -> float:
+    """How much the app at 0-based ``index`` of ``n`` results counts as a
+    possible leader, 1 for the first app, fading smoothly past the middle."""
+    def logistic(i):
+        return 1.0 / (1.0 + math.exp((i + 0.5 - n / 2) / LEADER_GATE_WIDTH))
+
+    return logistic(index) / logistic(0)
+
+
 class PopularityEstimator:
     """
     Estimates keyword search popularity from iTunes Search competitor data.
@@ -285,16 +393,61 @@ class PopularityEstimator:
          exact phrase in their title, the keyword itself is a known search term
     """
 
+    # Calibrated weights (estimate v2) - fitted 2026-08-17 against 327
+    # official Apple searchPopularity1to100 values (US, week of
+    # 2026-08-09) plus 90 below-top-terms negatives, via
+    # `manage.py apple_estimator_study`. Validation on a 30% holdout:
+    # Spearman 0.61, Pearson 0.65, MAE 8.6; brand-like subset Spearman
+    # 0.71 (previous hand-tuned weights: 0.09); head-vs-tail AUC 0.98.
+    # NEVER hand-tune these: refit with the study command under its
+    # pre-registered gates (see scoring-principles instructions).
+    V2_WEIGHTS: ClassVar[dict[str, float]] = {
+        "intercept": 3.6672,
+        "f_result": 1.0404,
+        "f_leader": -1.9714,
+        "f_title": 0.6129,
+        "f_depth": 2.9001,
+        "f_spec": 0.8644,
+        "f_exact": -0.338,
+        "x_top1_exact": 2.1709,
+        "x_leader_mag": 8.1524,
+    }
+
     def estimate(self, competitors: list[dict], keyword: str) -> int | None:
         """
-        Estimate popularity score for a keyword based on competitor data.
+        Estimate popularity for a keyword, calibrated to Apple's scale.
 
-        Args:
-            competitors: List of app dicts from ITunesSearchService.
-            keyword: The search keyword.
+        The estimate is a weighted sum of observable signal components
+        (see signal_components), with weights fitted against Apple's
+        official search popularity values - so the output speaks the
+        same 1-100 language as the Apple Ads source: reported head
+        keywords land around 40+, below-top-terms keywords land lower.
 
         Returns:
-            Estimated popularity score (5–100), or None if no data.
+            Estimated popularity (1-100), or None if no data.
+        """
+        components = self.signal_components(competitors, keyword)
+        if components is None:
+            return None
+        raw = self.V2_WEIGHTS["intercept"] + sum(
+            weight * components[name]
+            for name, weight in self.V2_WEIGHTS.items()
+            if name != "intercept"
+        )
+        return round(max(1, min(100, raw)))
+
+    def signal_components(self, competitors: list[dict], keyword: str) -> dict | None:
+        """Observable signal components feeding estimate() - and the ONLY
+        feature extractor `manage.py apple_estimator_study` uses, so the
+        fitted weights and the shipped code can never drift apart.
+
+        Returns the six classic components (post-dampening, as before)
+        plus two brand-aware magnitudes:
+          x_top1_exact  - log10 review count of the strongest exact-title
+                          match in the top 5 (separates popular brands
+                          like "indeed" from unknown names)
+          x_leader_mag  - log10 review count of the strongest top-half app
+        or None when there are no competitors.
         """
         if not competitors:
             return None
@@ -303,51 +456,38 @@ class PopularityEstimator:
         kw_lower = keyword.lower().strip()
         word_count = len(kw_lower.split()) if kw_lower else 1
 
-        # Signal 1: Result count (0–25 points)
+        # Signal 1: Result count (0-25 points)
         # More results = broader / more-popular search term
         result_score = min(25, n * 2.5)
 
-        # Signal 2: Leader strength (0–30 points)
-        # Only consider apps in the top half — tail apps are often
+        # Signal 2: Leader strength (0-30 points)
+        # Only consider apps in the top half - tail apps are often
         # backfill from broader terms (e.g. Pokémon GO at #24).
-        # Uses smooth log interpolation (same approach as difficulty
-        # sub-scores) to avoid cliff effects between bands.
+        # Smooth log interpolation avoids cliff effects between bands.
         top_half = competitors[: max(n // 2, 1)]
         max_reviews = max(c.get("userRatingCount", 0) for c in top_half)
-        if max_reviews <= 0:
-            leader_score = 0
-        elif max_reviews >= 1_000_000:
-            leader_score = 30
-        else:
-            leader_bands = [
-                (10, 1),
-                (100, 5),
-                (1_000, 10),
-                (10_000, 17),
-                (100_000, 24),
-                (1_000_000, 30),
-            ]
-            leader_score = 0
-            for i, (threshold, score) in enumerate(leader_bands):
-                if max_reviews < threshold:
-                    if i == 0:
-                        leader_score = (max_reviews / threshold) * score
-                    else:
-                        prev_t, prev_s = leader_bands[i - 1]
-                        ratio = math.log(max_reviews / prev_t) / math.log(
-                            threshold / prev_t
-                        )
-                        leader_score = prev_s + ratio * (score - prev_s)
-                    break
-            else:
-                leader_score = 30
+        leader_score = _leader_band_score(max_reviews)
 
-        # Signal 3: Title match density (0–20 points)
+        # The same leader, found smoothly: each app counts by a gate that
+        # fades over a few positions around the middle of the results instead
+        # of cutting at it, so an app moving one place never takes the leader
+        # with it. Measured by apple_estimator_study (candidates C and D); a
+        # signal is only used when V2_WEIGHTS names it.
+        smooth_leader_mag = max(
+            _leader_gate(index, n) * math.log10(1 + c.get("userRatingCount", 0))
+            for index, c in enumerate(competitors)
+        )
+        smooth_leader_score = _leader_band_score(10 ** smooth_leader_mag - 1)
+
+        # Signal 3: Title match density (0-20 points)
         # Strong title targeting (exact/all-word) is demand evidence.
+        # Also collects the strongest exact-match leader in the top 5
+        # for the x_top1_exact brand signal.
         title_matches = 0
         exact_phrase_matches = 0
         relevance_sum = 0.0
-        for c in competitors:
+        best_exact_reviews = 0
+        for index, c in enumerate(competitors):
             evidence = _keyword_title_evidence(
                 kw_lower,
                 c.get("trackName", ""),
@@ -357,13 +497,43 @@ class PopularityEstimator:
             if evidence["exact_phrase"]:
                 title_matches += 1
                 exact_phrase_matches += 1
+                if index < 5:
+                    best_exact_reviews = max(
+                        best_exact_reviews, c.get("userRatingCount", 0)
+                    )
             elif evidence["all_words"]:
                 title_matches += 1
         match_ratio = title_matches / n if n > 0 else 0
         title_score = min(20, match_ratio * 40)
 
-        # Signal 4: Market depth — median reviews (0–10 points)
-        # Uses smooth log interpolation to avoid cliff effects.
+        # How much of the top results' weight targets the keyword, 0 to 1.
+        # Each app weighs by its position (a smooth decay, so moving from #5
+        # to #6 changes little) and by the log of its ratings; its title
+        # counts by the graded evidence. One app changes the share only by
+        # its own part, never from nothing to everything.
+        share_num = share_den = 0.0
+        # The brand signal, built the same way: how big the apps carrying the
+        # keyword in their title are, weighted by position. Each app adds its
+        # own position weight's share of its magnitude, so one title gaining
+        # or losing the keyword moves it by that app's part and no more. It
+        # replaces x_top1_exact, the ratings of the single strongest exact
+        # match in the top five, which one title could switch from nothing to
+        # everything (STRENGTH_AND_RANK_CALIBRATION_PLAN.md, D7b).
+        mag_num = mag_den = 0.0
+        for index, c in enumerate(competitors):
+            position_weight = math.exp(-index / 3)
+            magnitude = math.log10(1 + c.get("userRatingCount", 0))
+            evidence = float(_keyword_title_evidence(
+                kw_lower, c.get("trackName", ""), c.get("primaryGenreName", ""),
+            )["evidence"])
+            share_num += position_weight * magnitude * evidence
+            share_den += position_weight * magnitude
+            mag_num += position_weight * magnitude * evidence
+            mag_den += position_weight
+        exact_share = share_num / share_den if share_den > 0 else 0.0
+        exact_mag = mag_num / mag_den if mag_den > 0 else 0.0
+
+        # Signal 4: Market depth - median reviews (0-10 points)
         sorted_counts = sorted(
             c.get("userRatingCount", 0) for c in competitors
         )
@@ -373,19 +543,12 @@ class PopularityEstimator:
             median = (
                 sorted_counts[n // 2 - 1] + sorted_counts[n // 2]
             ) / 2
-
+        depth_bands = [(10, 0.5), (100, 3), (1_000, 5), (10_000, 8), (50_000, 10)]
         if median <= 0:
             depth_score = 0
         elif median >= 50_000:
             depth_score = 10
         else:
-            depth_bands = [
-                (10, 0.5),
-                (100, 3),
-                (1_000, 5),
-                (10_000, 8),
-                (50_000, 10),
-            ]
             depth_score = 0
             for i, (threshold, score) in enumerate(depth_bands):
                 if median < threshold:
@@ -402,21 +565,14 @@ class PopularityEstimator:
                 depth_score = 10
 
         # Signal 5: Keyword specificity penalty (-5 to -30 points)
-        # Long-tail keywords (more words) have inherently lower search
-        # volume. "card value scanner" (3 words) gets more searches
-        # than "card value scanner for pokemon" (5 words). This is the
-        # strongest differentiator between head and long-tail terms.
-        #
-        # Smooth interpolation between calibration points instead of
-        # hard step function.  Calibration: 1→0, 2→-3, 3→-8, 4→-15,
-        # 5→-22, 6+→-28.
+        # Long-tail keywords (more words) have inherently lower volume.
         _sp_points = [(1, 0), (2, -3), (3, -8), (4, -15), (5, -22), (6, -28)]
         if word_count <= 1:
             specificity_penalty = 0
         elif word_count >= 6:
             specificity_penalty = -28
         else:
-            # Linear interpolation between the two bracketing points
+            specificity_penalty = -28
             for i in range(len(_sp_points) - 1):
                 lo_w, lo_v = _sp_points[i]
                 hi_w, hi_v = _sp_points[i + 1]
@@ -424,52 +580,75 @@ class PopularityEstimator:
                     t = (word_count - lo_w) / (hi_w - lo_w)
                     specificity_penalty = lo_v + t * (hi_v - lo_v)
                     break
-            else:
-                specificity_penalty = -28
 
-        # Signal 6: Exact phrase match bonus (0–15 points)
-        # If competitors have the EXACT keyword phrase in their title,
-        # it's a known, established search term that developers target.
-        # "card value scanner" appears in many titles → real search term.
-        # "card value scanner for pokemon" appears in zero → niche query.
+        # Signal 6: Exact phrase match ratio (0-15 points)
         exact_ratio = exact_phrase_matches / n if n > 0 else 0
         exact_bonus = min(15, exact_ratio * 50)
 
-        # --- Small sample dampening ---
-        # Ratio-based signals (title_score, exact_bonus) are unreliable
-        # when there are few results: 1/1 = 100% is a math artifact,
-        # not real demand evidence.  Instead of a hard cutoff, we use
-        # a smooth linear ramp that reaches full strength at n = 10.
+        # Small-sample dampening: ratio signals are unreliable with few
+        # results; smooth ramp to full strength at n = 10.
         sample_dampening = min(1.0, n / 10)
         title_score *= sample_dampening
         exact_bonus *= sample_dampening
 
-        # --- Backfill-aware dampening ---
-        # When few competitors have the keyword in their title, Apple
-        # is padding results with unrelated apps.  The high result
-        # count is artificial and shouldn’t count at full weight.
-        #
-        # Partial overlap is allowed only as weak evidence.
+        # Backfill-aware dampening: when few competitors carry the
+        # keyword in their title, Apple padded the results - volume
+        # signals count at reduced weight.
         relevance_ratio = relevance_sum / n if n > 0 else 0
         relevance = max(0.3, min(1.0, relevance_ratio * 2.6))
         result_score *= relevance
         leader_score *= relevance
+        smooth_leader_score *= relevance
         depth_score *= relevance
 
-        total = int(
-            result_score
-            + leader_score
-            + title_score
-            + depth_score
-            + specificity_penalty
-            + exact_bonus
-        )
-        return max(5, min(100, total))
+        return {
+            "f_result": result_score,
+            "f_leader": leader_score,
+            "f_title": title_score,
+            "f_depth": depth_score,
+            "f_spec": specificity_penalty,
+            "f_exact": exact_bonus,
+            "x_top1_exact": math.log10(1 + best_exact_reviews),
+            "x_leader_mag": math.log10(1 + max_reviews),
+            # The smooth replacements for x_top1_exact, measured by
+            # apple_estimator_study (STRENGTH_AND_RANK_CALIBRATION_PLAN.md D7).
+            # A signal is only used when V2_WEIGHTS names it.
+            "x_exact_share": exact_share,
+            "x_exact_mag": exact_mag,
+            "x_exact_brand": exact_share * math.log10(1 + max_reviews),
+            "f_leader_smooth": smooth_leader_score,
+            "x_leader_mag_smooth": smooth_leader_mag,
+            "x_exact_brand_smooth": exact_share * smooth_leader_mag,
+        }
 
 
 # --------------------------------------------------------------------------- #
 # iTunes Search API
 # --------------------------------------------------------------------------- #
+
+
+# One App Store search per keyword (aso/day_reads.py): its first SCORING_POOL
+# apps are the competitors every score reads, and the order of all of them is
+# every app's rank.
+RANKED_SEARCH_LIMIT = 200
+SCORING_POOL = 25
+
+
+@dataclass(frozen=True)
+class RankedSearch:
+    """One App Store search for a keyword in a storefront.
+
+    ranked_ids    every app's trackId in Apple's order, up to 200
+    apps          the first SCORING_POOL of them as full app dicts, in the
+                  same order: apps[i] is the app at ranked_ids[i]
+    result_count  how many apps the search returned (len(ranked_ids))
+    source        "itunes", or "appstore_ssr" when the fallback answered
+    """
+
+    ranked_ids: list
+    apps: list
+    result_count: int
+    source: str
 
 
 class ITunesSearchService:
@@ -491,7 +670,7 @@ class ITunesSearchService:
     LOOKUP_URL = "https://itunes.apple.com/lookup"
     SSR_SEARCH_URL = "https://apps.apple.com/{country}/iphone/search"
 
-    _SSR_HEADERS = {
+    _SSR_HEADERS: ClassVar[dict[str, str]] = {
         "User-Agent": (
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
             "AppleWebKit/605.1.15 (KHTML, like Gecko) "
@@ -504,33 +683,63 @@ class ITunesSearchService:
     # Timestamp of last SSR request — rate-limit to 1 req/sec minimum.
     _last_ssr_request: float = 0.0
 
-    def lookup_by_id(self, track_id: int, country: str = "us") -> dict | None:
+    def lookup_by_id(
+        self, track_id: int, country: str = "us", timeout: int = 30, *, retry: bool = True,
+    ) -> dict | None:
         """
-        Look up a single app by its iTunes trackId.
+        Look up a single app by its iTunes trackId. The one lookup of one app
+        that every feature uses (lookup_full_description reads it too).
 
-        Returns app dict or None.
+        Returns the app dict, or None when Apple answered and has no app with
+        this ID in this storefront. Raises ITunesRateLimited when Apple says
+        it is busy and SearchAPIUnavailableError when it cannot be reached,
+        does not answer in time or answers with an error, so no caller takes
+        a moment of trouble at Apple for a missing app. Until 2.28.1 every
+        failure returned None, and the AI Competitor reported a valid ID
+        (Forest, 866450515) as "not found" and blamed the AI service.
+
+        ``retry`` (the default, for background runs): a failed call is asked
+        again, up to LOOKUP_ATTEMPTS calls in all, paced by the adaptive
+        limiter every App Store loop uses (aso/throttle.py, which honours
+        Retry-After), and an empty answer is asked again once after a short
+        pause, because Apple's Lookup sometimes answers empty for a moment
+        for an app it lists. ``retry=False`` is for a request a person waits
+        on: one call, with a shorter ``timeout`` when the caller would rather
+        give up than keep the user waiting.
         """
-        try:
-            response = requests.get(
-                self.LOOKUP_URL,
-                params={"id": track_id, "country": country},
-                timeout=30,
-            )
-            response.raise_for_status()
-            results = response.json().get("results", [])
-            if results:
-                r = results[0]
-                return self._parse_app(r)
-            return None
-        except Exception as e:
-            logger.error(f"iTunes lookup failed for id {track_id}: {e}")
-            return None
+        attempts = LOOKUP_ATTEMPTS if retry else 1
+        empty_asks = 1 if retry else 0
+        limiter = AdaptiveITunesRateLimiter()
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                found = self.lookup_raw_chunk([track_id], country=country, timeout=timeout)
+            except ITunesAPIError as exc:
+                if attempt >= attempts:
+                    logger.warning("iTunes lookup of %s (%s) failed: %s", track_id, country, exc)
+                    raise
+                limiter.record_failure(retry_after=getattr(exc, "retry_after", None))
+                logger.info("iTunes lookup of %s (%s) failed (%s), asking again in %.1fs",
+                            track_id, country, exc, limiter.current_delay)
+                limiter.wait()
+                continue
+            raw = found.get(int(track_id))
+            if raw is not None:
+                return self._parse_app(raw)
+            if empty_asks <= 0:
+                return None
+            empty_asks -= 1
+            logger.info("iTunes lookup of %s (%s) answered empty, asking once more", track_id, country)
+            time.sleep(BASE_DELAY)
 
     def lookup_full_description(self, track_id: int, country: str = "us") -> dict:
         """Look up an app and return its description, genre, and context metadata.
 
         Returns a dict with keys: description, genre, rating, rating_count,
-        release_date, update_date, price, version, seller.
+        release_date, update_date, price, version, seller. The description is
+        optional for its callers, so when Apple has no such app or cannot be
+        reached (after lookup_by_id's retries) the defaults stand in.
         """
         defaults = {
             "description": "",
@@ -544,29 +753,104 @@ class ITunesSearchService:
             "seller": "",
         }
         try:
+            app = self.lookup_by_id(track_id, country=country)
+        except ITunesAPIError:
+            return defaults
+        if not app:
+            return defaults
+        return {
+            "description": app.get("description", ""),
+            "genre": app.get("primaryGenreName", ""),
+            "rating": app.get("averageUserRating", 0),
+            "rating_count": app.get("userRatingCount", 0),
+            "release_date": app.get("releaseDate", ""),
+            "update_date": app.get("currentVersionReleaseDate", ""),
+            "price": app.get("formattedPrice", "Free"),
+            "version": app.get("version", ""),
+            "seller": app.get("sellerName", ""),
+        }
+
+    def lookup_raw_chunk(self, track_ids, country: str = "us", timeout: int = 30) -> dict[int, dict]:
+        """One Lookup API call for up to 50 apps: {trackId: Apple's result as
+        Apple sent it}, with every field (version, release notes, screenshots,
+        the full description). The one call to Apple's Lookup behind every
+        lookup in the app.
+
+        An app Apple does not list is left out. Raises ITunesRateLimited when
+        Apple says it is busy (LOOKUP_BUSY_STATUSES, with its Retry-After),
+        and SearchAPIUnavailableError when it cannot be reached, does not
+        answer in time, answers with another error or sends something that
+        is not its JSON: a caller with a rate limiter paces itself, and no
+        caller takes a failure for an empty answer.
+        """
+        ids = [int(t) for t in track_ids][:50]
+        if not ids:
+            return {}
+        try:
             response = requests.get(
                 self.LOOKUP_URL,
-                params={"id": track_id, "country": country},
-                timeout=30,
+                params={"id": ",".join(str(t) for t in ids), "country": country},
+                timeout=timeout,
             )
+        except requests.Timeout as exc:
+            raise SearchAPIUnavailableError("Apple's App Store did not answer in time.") from exc
+        except requests.RequestException as exc:
+            raise SearchAPIUnavailableError("Apple's App Store could not be reached.") from exc
+        if response.status_code in LOOKUP_BUSY_STATUSES:
+            logger.info("Lookup API answered %s (Retry-After=%s)",
+                        response.status_code, response.headers.get("Retry-After"))
+            raise ITunesRateLimited(
+                retry_after=self._parse_retry_after(response.headers.get("Retry-After")),
+            )
+        try:
             response.raise_for_status()
+        except requests.HTTPError as exc:
+            logger.warning("Lookup API answered %s", response.status_code)
+            raise SearchAPIUnavailableError("Apple's App Store answered with an error.") from exc
+        try:
             results = response.json().get("results", [])
-            if results:
-                r = results[0]
-                return {
-                    "description": r.get("description", ""),
-                    "genre": r.get("primaryGenreName", ""),
-                    "rating": r.get("averageUserRating", 0),
-                    "rating_count": r.get("userRatingCount", 0),
-                    "release_date": r.get("releaseDate", ""),
-                    "update_date": r.get("currentVersionReleaseDate", ""),
-                    "price": r.get("formattedPrice", "Free"),
-                    "version": r.get("version", ""),
-                    "seller": r.get("sellerName", ""),
-                }
-            return defaults
-        except Exception:
-            return defaults
+        except (ValueError, AttributeError) as exc:
+            raise SearchAPIUnavailableError(
+                "Apple's App Store sent an answer that could not be read.",
+            ) from exc
+        found: dict[int, dict] = {}
+        for raw in results:
+            track_id = raw.get("trackId") if isinstance(raw, dict) else None
+            if track_id:
+                found[int(track_id)] = raw
+        return found
+
+    _APP_STORE_ID = re.compile(r"/id(\d+)")
+    _APP_STORE_COUNTRY = re.compile(r"apps\.apple\.com/([a-z]{2})/", re.IGNORECASE)
+
+    @classmethod
+    def storefront_in_link(cls, text: str) -> str | None:
+        """The storefront an App Store link names ("se" for
+        apps.apple.com/se/app/...), or None when it names none."""
+        match = cls._APP_STORE_COUNTRY.search(text or "")
+        return match.group(1).lower() if match else None
+
+    def find_apps(self, query: str, country: str = "us", limit: int = 5) -> list[dict]:
+        """The apps a person means by what they typed. An App Store link or
+        a bare App Store ID finds that one app (in the link's own storefront
+        when it names one); anything else is an App Store search. Parsed app
+        dicts, best match first; [] when nothing matches.
+
+        A person waits on the answer, so a lookup is one call (no retries).
+        Raises ITunesAPIError (SearchAPIUnavailableError or ITunesRateLimited)
+        when Apple cannot be reached or is busy, never [] for that.
+        """
+        text = (query or "").strip()
+        if len(text) < 2:
+            return []
+        match = self._APP_STORE_ID.search(text)
+        if match or text.isdigit():
+            track_id = int(match.group(1) if match else text)
+            found = self.lookup_by_id(
+                track_id, country=self.storefront_in_link(text) or country, retry=False,
+            )
+            return [found] if found else []
+        return self.search_apps(text, country=country, limit=limit)
 
     # ── Primary: iTunes Search API ──────────────────────────────────────
 
@@ -592,13 +876,10 @@ class ITunesSearchService:
         # waiting Retry-After (or 5s default) before retrying. Permanent
         # errors (4xx) raise immediately so SSR fallback can take over.
         for attempt in range(2):
-            try:
-                response = requests.get(self.SEARCH_URL, params=params, timeout=15)
-            except requests.Timeout:
-                # Tighter timeout failed — let caller try SSR fallback.
-                # No second attempt: timeouts here usually mean Apple's API
-                # is overloaded and SSR may be more responsive.
-                raise
+            # A timeout raises at once, with no second attempt: it usually
+            # means Apple's API is overloaded, and the caller's SSR fallback
+            # may answer sooner.
+            response = requests.get(self.SEARCH_URL, params=params, timeout=15)
 
             status = response.status_code
             if status in (429, 503):
@@ -613,11 +894,11 @@ class ITunesSearchService:
                     )
                     time.sleep(wait)
                     continue
-                # Second attempt also rate-limited — surface it so the runner
-                # can record the failure on the limiter and consider SSR.
-                raise ITunesRateLimited(
-                    f"iTunes API rate-limited ({status})", retry_after=retry_after,
-                )
+                # Second attempt also rate-limited: surface it so the runner
+                # can record the failure on the limiter and consider SSR. The
+                # message is the plain one a failed run's report gives.
+                logger.info("iTunes API returned %d again (keyword=%r)", status, keyword)
+                raise ITunesRateLimited(retry_after=retry_after)
 
             # Any other 5xx: retry once with a brief pause; otherwise raise.
             if 500 <= status < 600:
@@ -631,7 +912,7 @@ class ITunesSearchService:
             return [self._parse_app(r) for r in data.get("results", [])]
 
         # Should be unreachable — both attempts return or raise above.
-        raise SearchAPIUnavailableError("iTunes API exhausted retries")
+        raise SearchAPIUnavailableError(APP_STORE_UNAVAILABLE)
 
     @staticmethod
     def _parse_retry_after(value: str | None) -> float | None:
@@ -768,21 +1049,12 @@ class ITunesSearchService:
 
         for start in range(0, len(track_ids), chunk_size):
             chunk = track_ids[start : start + chunk_size]
-            ids_str = ",".join(str(tid) for tid in chunk)
             try:
-                resp = requests.get(
-                    self.LOOKUP_URL,
-                    params={"id": ids_str, "country": country},
-                    timeout=30,
-                )
-                resp.raise_for_status()
-                for r in resp.json().get("results", []):
-                    tid = r.get("trackId")
-                    if tid:
-                        result[tid] = self._parse_app(r)
-            except Exception as e:
+                for track_id, raw in self.lookup_raw_chunk(chunk, country=country).items():
+                    result[track_id] = self._parse_app(raw)
+            except Exception as e:  # noqa: BLE001 (one failed chunk must not lose the others)
                 logger.warning(f"Batch lookup failed for chunk: {e}")
-                # Continue with next chunk — partial data is better than none
+                # Continue with next chunk: partial data is better than none
 
         return result
 
@@ -810,11 +1082,7 @@ class ITunesSearchService:
         lookup_map = self._batch_lookup(target_ids, country=country)
 
         if not lookup_map:
-            raise SearchAPIUnavailableError(
-                "App Store search data is temporarily unavailable. "
-                "Both the iTunes Search API and the Lookup API failed. "
-                "Please try again in a few minutes."
-            )
+            raise SearchAPIUnavailableError(APP_STORE_UNAVAILABLE)
 
         # Return in ranking order, only apps that Lookup returned
         apps = []
@@ -828,11 +1096,89 @@ class ITunesSearchService:
 
     # ── Public API ──────────────────────────────────────────────────────
 
+    def search_ranked(self, keyword: str, country: str = "us") -> RankedSearch:
+        """The one App Store search behind every keyword score and rank.
+
+        Asks the iTunes Search API for up to RANKED_SEARCH_LIMIT apps. The
+        first SCORING_POOL are the competitors every score reads; the order
+        of all of them is every app's rank, so a row's rank and its
+        competitor list come from one list and never disagree. Asking Apple
+        for 25 and for 200 returns different orders, and the 200 list is the
+        one closer to the App Store's own (probe of 2026-09-30,
+        docs/development/ONE_READ_PER_DAY_PLAN.md).
+
+        Only aso/day_reads.py calls this: every other path reads through it,
+        so a keyword costs Apple one search per storefront per day.
+
+        Falls back to the App Store search page (ordered ids) plus one Lookup
+        call for the first SCORING_POOL ids when the iTunes API fails. An id
+        among those that the Lookup does not return is dropped from the
+        order too, so apps[i] is always the app at ranked_ids[i].
+
+        Raises ITunesRateLimited (no fallback: Apple would throttle the page
+        too) and SearchAPIUnavailableError when both sources fail.
+        """
+        try:
+            results = self._search_itunes(keyword, country=country, limit=RANKED_SEARCH_LIMIT)
+        except ITunesRateLimited:
+            raise
+        except Exception as e:  # noqa: BLE001 (any failure of the API falls back to the App Store page)
+            logger.warning(
+                f"iTunes Search API failed for '{keyword}' ({country}), "
+                f"falling back to SSR: {e}"
+            )
+        else:
+            seen = set()
+            ordered = []
+            for app in results:
+                track_id = app.get("trackId")
+                if track_id and track_id not in seen:
+                    seen.add(track_id)
+                    ordered.append(app)
+            apps = ordered[:SCORING_POOL]
+            for app in apps:
+                app["_data_source"] = "itunes"
+            return RankedSearch(
+                ranked_ids=[int(app["trackId"]) for app in ordered],
+                apps=apps,
+                result_count=len(ordered),
+                source="itunes",
+            )
+
+        try:
+            page_ids = self._extract_ssr_app_ids(self._fetch_ssr_page(keyword, country=country))
+        except Exception as e:
+            logger.error(f"SSR fallback also failed for '{keyword}' ({country}): {e}")
+            raise SearchAPIUnavailableError(APP_STORE_UNAVAILABLE) from e
+        page_ids = [int(track_id) for track_id in page_ids[:RANKED_SEARCH_LIMIT]]
+        if not page_ids:
+            return RankedSearch(ranked_ids=[], apps=[], result_count=0, source="appstore_ssr")
+        head = page_ids[:SCORING_POOL]
+        lookup_map = self._batch_lookup(head, country=country)
+        if not lookup_map:
+            raise SearchAPIUnavailableError(APP_STORE_UNAVAILABLE)
+        apps = []
+        for track_id in head:
+            app = lookup_map.get(track_id)
+            if app is not None:
+                app["_data_source"] = "appstore_ssr"
+                apps.append(app)
+        ranked_ids = [int(app["trackId"]) for app in apps] + page_ids[SCORING_POOL:]
+        logger.info(f"SSR fallback returned {len(ranked_ids)} apps for '{keyword}' ({country})")
+        return RankedSearch(
+            ranked_ids=ranked_ids, apps=apps, result_count=len(ranked_ids), source="appstore_ssr",
+        )
+
     def search_apps(
         self, keyword: str, country: str = "us", limit: int = 10
     ) -> list[dict]:
         """
         Search for iOS apps matching a keyword.
+
+        Not for keyword scores or ranks: those read through
+        aso.day_reads.get_or_fetch (one search per keyword, storefront and
+        day). This serves the app name search (views.app_lookup_view), the
+        storefront probe and the rank calibration study.
 
         Tries the iTunes Search API first.  If it fails (HTTP error,
         timeout, etc.), falls back to App Store SSR scraping + Lookup
@@ -849,6 +1195,7 @@ class ITunesSearchService:
 
         Raises:
             SearchAPIUnavailableError: When both data sources are down.
+            ITunesRateLimited: When Apple says it is busy (no fallback).
         """
         # Try primary source: iTunes Search API
         try:
@@ -862,7 +1209,7 @@ class ITunesSearchService:
             # the next call. SSR isn't a sensible fallback here — Apple
             # would rate-limit the SSR endpoint too.
             raise
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 (any failure of the API falls back to the App Store page)
             logger.warning(
                 f"iTunes Search API failed for '{keyword}' ({country}), "
                 f"falling back to SSR: {e}"
@@ -881,82 +1228,16 @@ class ITunesSearchService:
             logger.error(
                 f"SSR fallback also failed for '{keyword}' ({country}): {e}"
             )
-            raise SearchAPIUnavailableError(
-                "App Store search data is temporarily unavailable. "
-                "Both the iTunes Search API and the App Store website "
-                "returned errors. Please try again in a few minutes."
-            ) from e
-
-    def find_app_rank(
-        self, keyword: str, track_id: int, country: str = "us"
-    ) -> int | None:
-        """
-        Find where a specific app ranks for a keyword.
-
-        Searches up to 200 results (iTunes API max) and returns the
-        1-based position of the app, or None if not found.
-
-        If the iTunes API fails, falls back to checking the position
-        in the SSR ordered ID list (200+ apps, no full hydration needed).
-
-        Args:
-            keyword: The search term.
-            track_id: The iTunes trackId to look for.
-            country: Two-letter country code.
-
-        Returns:
-            1-based rank position, or None if not in top 200.
-
-        Raises:
-            SearchAPIUnavailableError: When both data sources are down.
-        """
-        # Try primary: iTunes Search API
-        try:
-            results = self._search_itunes(
-                keyword, country=country, limit=200
-            )
-            for i, app in enumerate(results):
-                if app.get("trackId") == track_id:
-                    return i + 1
-            return None
-        except Exception as e:
-            logger.warning(
-                f"iTunes API failed for rank lookup '{keyword}' ({country}), "
-                f"falling back to SSR: {e}"
-            )
-
-        # Fallback: SSR ID list (no full hydration — lightweight)
-        try:
-            return self._find_rank_in_ssr(keyword, track_id, country=country)
-        except SearchAPIUnavailableError:
-            raise
-        except Exception as e:
-            logger.error(
-                f"SSR rank fallback also failed for '{keyword}' ({country}): {e}"
-            )
-            raise SearchAPIUnavailableError(
-                "App Store search data is temporarily unavailable. "
-                "Cannot determine app ranking."
-            ) from e
-
-    def _find_rank_in_ssr(
-        self, keyword: str, track_id: int, country: str = "us"
-    ) -> int | None:
-        """Check app rank using the ordered SSR ID list.
-
-        No full app hydration — just position in the list.
-        """
-        ssr_data = self._fetch_ssr_page(keyword, country=country)
-        all_ids = self._extract_ssr_app_ids(ssr_data)
-        try:
-            return all_ids.index(track_id) + 1
-        except ValueError:
-            return None
+            raise SearchAPIUnavailableError(APP_STORE_UNAVAILABLE) from e
 
     @staticmethod
     def _parse_app(result: dict) -> dict:
-        """Parse an iTunes API result into a standardized app dict."""
-        desc = result.get("description", "")
+        """Parse an iTunes API result into a standardized app dict.
+
+        The description stays whole, because the AI tabs read it. The one
+        place that shortens it is ``display_snippet``, which makes the form
+        stored beside keywords for the screens.
+        """
         return {
             "trackId": result.get("trackId"),
             "trackName": result.get("trackName", ""),
@@ -969,11 +1250,67 @@ class ITunesSearchService:
             ),
             "primaryGenreName": result.get("primaryGenreName", ""),
             "formattedPrice": result.get("formattedPrice", "Free"),
-            "description": (desc[:200] + "...") if len(desc) > 200 else desc,
+            "description": result.get("description", ""),
+            "version": result.get("version", ""),
             "sellerName": result.get("sellerName", ""),
             "bundleId": result.get("bundleId", ""),
             "trackViewUrl": result.get("trackViewUrl", ""),
         }
+
+
+# --------------------------------------------------------------------------- #
+# Display form of an app, for storage beside keywords
+# --------------------------------------------------------------------------- #
+
+# The keys a stored app dict has always carried: the fields _parse_app
+# returned until it kept the full description, plus the "_data_source" tag
+# search_apps adds. Keys the parser gains (such as "version") stay out of
+# storage unless a screen needs them.
+STORED_APP_KEYS = (
+    "trackId",
+    "trackName",
+    "artworkUrl100",
+    "averageUserRating",
+    "userRatingCount",
+    "releaseDate",
+    "currentVersionReleaseDate",
+    "primaryGenreName",
+    "formattedPrice",
+    "description",
+    "sellerName",
+    "bundleId",
+    "trackViewUrl",
+    "_data_source",
+)
+
+DESCRIPTION_SNIPPET_CHARS = 200
+
+
+def display_snippet(app):
+    """The form of ``app`` that is stored beside a keyword for the screens.
+
+    A new dict with the ``STORED_APP_KEYS`` of ``app`` and its description
+    cut to ``DESCRIPTION_SNIPPET_CHARS`` characters plus "...". No screen
+    shows a stored description, and 25 full descriptions per keyword per day
+    would grow the database about twentyfold, so storage keeps the form it
+    always had while the AI reads every word. Never changes ``app``;
+    applying it twice gives the same result as once; anything that is not a
+    dict comes back as it is.
+    """
+    if not isinstance(app, dict):
+        return app
+    snippet = {key: app[key] for key in STORED_APP_KEYS if key in app}
+    description = snippet.get("description")
+    if isinstance(description, str) and len(description) > DESCRIPTION_SNIPPET_CHARS:
+        snippet["description"] = description[:DESCRIPTION_SNIPPET_CHARS] + "..."
+    return snippet
+
+
+def display_snippets(apps):
+    """``display_snippet`` for every app of a list; an empty list or None comes back as it is."""
+    if not apps:
+        return apps
+    return [display_snippet(app) for app in apps]
 
 
 # --------------------------------------------------------------------------- #
@@ -991,47 +1328,36 @@ class DownloadEstimator:
       2. Position → tap-through rate (TTR) — percentage of searchers who
          tap on the result at each position.  Follows a well-documented
          power-law decay curve.
-      3. Conversion rate — percentage of taps that become installs.
-         Varies by category/listing quality; 5–20 % range used.
+      3. Conversion rate: the share of taps that become installs, 5%.
 
-    All numbers are rough estimates shown as ranges (low–high).
+    Every figure is shown as a range from a tenth of the estimate to the
+    estimate (RANGE_LOW_SHARE below).
     """
 
-    # Popularity score → estimated daily searches.
-    # Piecewise-linear mapping from ASO industry data.
-    # Calibrated against real App Store data.
-    # Apple does not publish search volumes; these are conservative
-    # estimates cross-checked with real download / rank observations.
-    # Anchor: popularity 68, rank #8  →  low single-digit downloads/day
-    # for early-stage apps in competitive categories.
-    #
-    # The growth rate accelerates above pop 75 because Apple's
-    # popularity scale is roughly logarithmic — each point at
-    # the top represents a much larger absolute search increment
-    # than at the bottom.
-    _POP_TO_SEARCHES = [
-        # (popularity, daily_searches)
-        (5, 1),
-        (10, 3),
-        (15, 5),
-        (20, 10),
-        (25, 20),
-        (30, 35),
-        (35, 55),
-        (40, 90),
-        (45, 140),
-        (50, 200),
-        (55, 290),
-        (60, 400),
-        (65, 550),
-        (70, 750),
-        (75, 1_100),
-        (80, 2_000),
-        (85, 4_000),
-        (90, 8_000),
-        (95, 16_000),
-        (100, 32_000),
-    ]
+    # Popularity → estimated daily searches: the canonical curve lives
+    # in aso.scoring.POP_TO_SEARCHES (threshold-anchored to Apple's
+    # official dataset; see the derivation comment there). Both
+    # popularity sources speak the same calibrated 1-100 scale since
+    # estimate v2, so one curve serves everything - no source switching.
+
+    def _daily_searches(self, popularity: int) -> float:
+        """Interpolate daily search volume from popularity score."""
+        from .scoring import POP_TO_SEARCHES
+
+        if popularity is None or popularity <= 0:
+            return 0
+        pts = POP_TO_SEARCHES
+        if popularity <= pts[0][0]:
+            return pts[0][1] * (popularity / pts[0][0])
+        if popularity >= pts[-1][0]:
+            return pts[-1][1]
+        for i in range(1, len(pts)):
+            p0, s0 = pts[i - 1]
+            p1, s1 = pts[i]
+            if popularity <= p1:
+                ratio = (popularity - p0) / (p1 - p0)
+                return s0 + ratio * (s1 - s0)
+        return pts[-1][1]
 
     # Position → tap-through rate (fraction of searchers who tap).
     #
@@ -1049,7 +1375,7 @@ class DownloadEstimator:
     #
     # Decay follows a power-law: steep drop from #1 to #5 (all on
     # first screen), then gradual tail for positions requiring scroll.
-    _TTR = {
+    _TTR: ClassVar[dict[int, float]] = {
         1: 0.30,
         2: 0.18,
         3: 0.12,
@@ -1072,90 +1398,99 @@ class DownloadEstimator:
         20: 0.0007,
     }
 
-    # Conversion rate (tap → install): range for free apps.
-    #
-    # Low end (5 %): unknown indie app, weak listing, few ratings.
-    # High end (20 %): category leader, strong brand, 100 K+ ratings.
+    # Install rate (tap to install) behind every estimate: 5%, the low end of
+    # what published studies report for free apps (an unknown app with a weak
+    # listing). Every score and tag is built on it.
     _CVR_LOW = 0.05
-    _CVR_HIGH = 0.20
 
-    # Market-size multiplier: scales search volumes relative to US.
-    # _POP_TO_SEARCHES is calibrated for the US App Store (~180 M iPhones).
-    # Smaller markets have proportionally fewer searches for the same
-    # popularity score.  Factors derived from estimated active-iPhone
-    # installed base per country relative to the US.
-    _MARKET_SIZE = {
-        "us": 1.0,
-        # Tier 2 — large markets (30 M+ iPhones)
-        "cn": 0.45,
-        "jp": 0.35,
-        "gb": 0.30,
-        "de": 0.25,
-        "fr": 0.22,
-        "kr": 0.20,
-        "br": 0.18,
-        "in": 0.15,
-        "ca": 0.15,
-        "au": 0.12,
-        "ru": 0.12,
-        "it": 0.12,
-        "es": 0.10,
-        "mx": 0.10,
-        # Tier 3 — mid-size markets (5–30 M iPhones)
-        "tw": 0.08,
-        "nl": 0.07,
-        "se": 0.06,
-        "ch": 0.06,
-        "pl": 0.05,
-        "tr": 0.05,
-        "th": 0.05,
-        "id": 0.05,
-        "be": 0.04,
-        "at": 0.04,
-        "no": 0.04,
-        "dk": 0.04,
-        "sg": 0.04,
-        "il": 0.04,
-        "ae": 0.04,
-        "sa": 0.04,
-        "ph": 0.04,
-        "my": 0.04,
-        "za": 0.03,
-        "ie": 0.03,
-        "fi": 0.03,
-        "pt": 0.03,
-        "nz": 0.03,
-        "cl": 0.03,
-        "ar": 0.03,
-        "co": 0.03,
-        "ng": 0.03,
-        "eg": 0.03,
-        "pk": 0.02,
-        "ke": 0.02,
-        "gh": 0.02,
-        "tz": 0.02,
-        "ug": 0.02,
-    }
-    _MARKET_SIZE_DEFAULT = 0.03
+    # Every download range runs from a tenth of the estimate to the estimate.
+    # Two things RespectASO cannot know move real downloads that much: how
+    # many people search terms Apple does not report (its dataset only says
+    # they are below its reporting floor), and how many of the people who see
+    # the app install it. Checked on 2026-09-27 against one app's App Store
+    # Connect figures (Options Trading AI, US, June 28 to September 25): about
+    # 14 search downloads a day estimated, about 2 a day real from every
+    # source. It replaced a 5% to 20% install range, whose high end sat four
+    # times further from that app than the estimate.
+    RANGE_LOW_SHARE = 0.1
 
+    # Market size scales search volumes relative to the US App Store, which
+    # is what POP_TO_SEARCHES is calibrated for. The factor per storefront
+    # lives in aso/countries.py, the one place that defines a country: 48 of
+    # them were measured against observed App Store data, the rest are derived
+    # from population and regional iOS share. A storefront that is genuinely
+    # tiny gets a tiny number rather than one shared default, which used to
+    # credit Andorra with roughly five million iPhones.
 
+    # Past #20 the tap-through rate keeps falling as a power law of the rank,
+    # with the exponent the table itself shows between #10 and #20
+    # (log(TTR10/TTR20) / log(2), about 4.2). #40 then gets about 5% of what
+    # #20 gets and #100 about 0.1%: little, but never a cliff to zero.
+    TAIL_EXPONENT = math.log(_TTR[10] / _TTR[20]) / math.log(20 / 10)
 
-    def _daily_searches(self, popularity: int) -> float:
-        """Interpolate daily search volume from popularity score."""
-        if popularity is None or popularity <= 0:
-            return 0
-        pts = self._POP_TO_SEARCHES
-        if popularity <= pts[0][0]:
-            return pts[0][1] * (popularity / pts[0][0])
-        if popularity >= pts[-1][0]:
-            return pts[-1][1]
-        for i in range(1, len(pts)):
-            p0, s0 = pts[i - 1]
-            p1, s1 = pts[i]
-            if popularity <= p1:
-                ratio = (popularity - p0) / (p1 - p0)
-                return s0 + ratio * (s1 - s0)
-        return pts[-1][1]
+    @classmethod
+    def ttr_at(cls, rank: float) -> float:
+        """Share of searchers who tap the result at ``rank``, for any real rank.
+
+        Whole ranks 1 to 20 return exactly the table. Between them the rate
+        is interpolated on a log scale, and past #20 it follows the power law
+        above, so the curve is continuous from #1 to any depth and every
+        figure built on it moves smoothly.
+        """
+        if rank <= 1:
+            return cls._TTR[1]
+        if rank <= 20:
+            low = math.floor(rank)
+            if low >= 20:
+                return cls._TTR[20]
+            fraction = rank - low
+            if fraction == 0:
+                return cls._TTR[low]
+            return math.exp(
+                math.log(cls._TTR[low]) * (1 - fraction)
+                + math.log(cls._TTR[low + 1]) * fraction
+            )
+        return cls._TTR[20] * (20 / rank) ** cls.TAIL_EXPONENT
+
+    def _downloads(self, searches: float, position: float, cvr: float) -> float:
+        """Downloads a day at one rank. The one place this is multiplied.
+
+        Searches x how many searchers tap that rank x how many of those
+        install. Everything that quotes a download figure, the chart, the
+        table and the opportunity score, comes through here.
+        """
+        return searches * self.ttr_at(position) * cvr
+
+    def downloads_at(
+        self, popularity: int, rank: float, country: str = "us",
+    ) -> float:
+        """The conservative daily downloads at one rank, UNROUNDED.
+
+        What the opportunity score is built on. ``rank`` is a real number
+        (the reachable rank is), and any depth is allowed: past #20 the
+        downloads keep shrinking along ttr_at() instead of dropping to zero.
+        estimate() rounds the same figures at whole ranks 1 to 20 for the
+        chart, which is right for a chart and wrong for a score.
+        """
+        from .scoring import daily_searches
+
+        if not popularity or popularity <= 0 or rank < 1:
+            return 0.0
+        return self._downloads(
+            daily_searches(popularity, country or "us"), rank, self._CVR_LOW,
+        )
+
+    def range_at(
+        self, popularity: int, rank: float, country: str = "us",
+    ) -> tuple[float, float]:
+        """Daily downloads at one rank, low and high, UNROUNDED: the range
+        estimate() rounds into its positions, for a sentence that quotes it."""
+        from .scoring import daily_searches
+
+        if not popularity or popularity <= 0 or rank < 1:
+            return 0.0, 0.0
+        estimate = self._downloads(daily_searches(popularity, country or "us"), rank, self._CVR_LOW)
+        return estimate * self.RANGE_LOW_SHARE, estimate
 
     def estimate(
         self,
@@ -1173,19 +1508,19 @@ class DownloadEstimator:
             downloads_high for positions 1–20
           - tiers: summary for Top 5, Top 6-10, Top 11-20
         """
-        searches = self._daily_searches(popularity)
+        from .scoring import daily_searches
 
-        # Scale search volume by relative App Store market size.
-        market_mult = self._MARKET_SIZE.get(
-            (country or "us").lower(), self._MARKET_SIZE_DEFAULT
-        )
-        searches *= market_mult
+        entry = countries.get(country or "us")
+        market_source = entry.market_source if entry else "derived"
+        # One place does popularity times market size, so the number behind a
+        # download range and the number behind a classification are the same.
+        searches = daily_searches(popularity, country or "us")
 
         positions = []
         for pos in range(1, 21):
             ttr = self._TTR.get(pos, 0.001)
-            dl_low = searches * ttr * self._CVR_LOW
-            dl_high = searches * ttr * self._CVR_HIGH
+            dl_high = self._downloads(searches, pos, self._CVR_LOW)
+            dl_low = dl_high * self.RANGE_LOW_SHARE
             positions.append({
                 "pos": pos,
                 "ttr": round(ttr * 100, 2),
@@ -1213,12 +1548,76 @@ class DownloadEstimator:
             "daily_searches": round(searches, 2),
             "positions": positions,
             "tiers": tiers,
+            # Two honesty flags the renderers read. `below_threshold` marks a
+            # market so small that the keyword sees under one search a day,
+            # where a download range of zeros would read as a bug rather than
+            # as a fact. `market_source` says whether the market size behind
+            # these numbers was measured or derived.
+            "below_threshold": searches < 1.0,
+            "market_source": market_source,
         }
 
 
 # --------------------------------------------------------------------------- #
 # Keyword Difficulty Calculator
 # --------------------------------------------------------------------------- #
+
+
+# The weak leader cap: a #1 app with few reviews means the keyword is easy,
+# whatever backfill sits below it. Full strength below LEADER_CAP_FULL
+# reviews, fading out on a log scale to nothing at LEADER_CAP_GONE, so a
+# leader crossing 1,000 reviews no longer lifts difficulty by up to 20
+# points in one step.
+LEADER_CAP_FULL = 1_000
+LEADER_CAP_GONE = 3_000
+
+
+def leader_cap(leader_reviews: float) -> float:
+    """The ceiling a weak #1 app puts on difficulty: 15 at 0 reviews, 50 at
+    about 1,000, rising slowly beyond."""
+    return 15 + 35 * math.log10(leader_reviews + 1) / math.log10(1001)
+
+
+def leader_cap_weight(leader_reviews: float) -> float:
+    """How much of the weak leader cap applies, 1 down to 0."""
+    if leader_reviews <= LEADER_CAP_FULL:
+        return 1.0
+    if leader_reviews >= LEADER_CAP_GONE:
+        return 0.0
+    return 1.0 - math.log10(leader_reviews / LEADER_CAP_FULL) / math.log10(
+        LEADER_CAP_GONE / LEADER_CAP_FULL
+    )
+
+
+def small_result_cap(result_count: int) -> int | None:
+    """The ceiling a tiny result set puts on difficulty.
+
+    Ten points per app Apple returns, up to nine apps; from ten apps on,
+    no ceiling. It used to be 10, 20, 31, 40 for one to four apps and then
+    nothing at five, a step of up to 60 points for one more app.
+    """
+    if 1 <= result_count <= 9:
+        return 10 * result_count
+    return None
+
+
+# The fields of a difficulty breakdown that hold an App Store name, and the
+# bracketed names its sentences quote: "The #1 app (Brand - Tagline) has".
+_BREAKDOWN_NAME_KEYS = ("weakest_app", "brand_name")
+_NAME_IN_BRACKETS = re.compile(r"\([^()]*\)")
+
+
+def readable_breakdown(breakdown: dict | None) -> dict:
+    """A difficulty breakdown stored by an older version, with its sentences
+    read by today's dash rule (aso/copy_rules.py). App names are App Store
+    data and stay exactly as written. Search History and the Opportunity
+    Finder were rewritten once (DIFFICULTY_VERSION 3); an AI run's rows are
+    a snapshot, so they are read through this (aso_pro/explained_rows.py)."""
+    from .copy_rules import no_dash_punctuation_keeping, walk_prose
+
+    return walk_prose(breakdown or {},
+                      lambda text: no_dash_punctuation_keeping(text, _NAME_IN_BRACKETS),
+                      keep=_BREAKDOWN_NAME_KEYS)
 
 
 class DifficultyCalculator:
@@ -1363,11 +1762,11 @@ class DifficultyCalculator:
 
         # --- Publisher Diversity (10%) — 0-100 normalized ---
         unique_publishers = len(
-            set(
+            {
                 c.get("sellerName", "").lower()
                 for c in competitors
                 if c.get("sellerName")
-            )
+            }
         )
         publisher_diversity = min(100, (unique_publishers / max(n, 1)) * 100)
 
@@ -1382,9 +1781,7 @@ class DifficultyCalculator:
                 c.get("primaryGenreName", ""),
             )
             relevance_sum += float(evidence["evidence"])
-            if evidence["exact_phrase"]:
-                title_match_count += 1
-            elif evidence["all_words"]:
+            if evidence["exact_phrase"] or evidence["all_words"]:
                 title_match_count += 1
         title_relevance = min(100, (title_match_count / max(n, 1)) * 100)
 
@@ -1420,14 +1817,16 @@ class DifficultyCalculator:
         market_age *= relevance
 
         # --- Weighted Total ---
+        from .strength import WEIGHTS
+
         raw_total = int(
-            rating_volume * 0.30
-            + review_velocity * 0.10
-            + dominant_players * 0.20
-            + rating_quality * 0.10
-            + market_age * 0.10
-            + publisher_diversity * 0.10
-            + title_relevance * 0.10
+            rating_volume * WEIGHTS["volume"]
+            + review_velocity * WEIGHTS["momentum"]
+            + dominant_players * WEIGHTS["dominance"]
+            + rating_quality * WEIGHTS["rating"]
+            + market_age * WEIGHTS["age"]
+            + publisher_diversity * WEIGHTS["publishers"]
+            + title_relevance * WEIGHTS["title"]
         )
         raw_total = max(1, min(100, raw_total))
 
@@ -1478,7 +1877,6 @@ class DifficultyCalculator:
 
         n = len(competitors)
         kw_lower = keyword.lower().strip()
-        kw_words = set(kw_lower.split()) if kw_lower else set()
 
         # --- Core difficulty (same algo used for tiers) ---
         raw_total, sub_scores = self._compute_raw_difficulty(
@@ -1526,77 +1924,22 @@ class DifficultyCalculator:
 
         # Signal 0: Small Result Set Cap
         # If Apple returns very few results, there's objectively little
-        # competition for this keyword regardless of how strong those
-        # few apps are. Sub-scores like publisher diversity and title
-        # relevance become statistically meaningless with tiny samples.
-        #
-        # Smooth curve instead of step function:
-        # Explicit caps keep tiny samples from looking competitive
-        # while preserving moderate markets at n=5.
-        #   n=1→10, n=2→20, n=3→31, n=4→40
-        # Only applies when n ≤ 4 (n=5 keeps the raw score).
-        small_caps = {1: 10, 2: 20, 3: 31, 4: 40}
-        if n in small_caps:
-            small_cap = small_caps[n]
-            if total > small_cap:
-                total = small_cap
-                override_reason = "small_result_set"
+        # competition for this keyword regardless of how strong those few
+        # apps are. Ten points of ceiling per app returned, up to nine.
+        small_cap = small_result_cap(n)
+        if small_cap is not None and total > small_cap:
+            total = small_cap
+            override_reason = "small_result_set"
 
+        # Signals 1 and 2: the weak leader cap and the backfill discount,
+        # shared with every ranking tier.
         if kw_lower and n >= 2:
-            # Signal 1: Weak Leader Cap
-            # The #1 app's review count is the ultimate reality check.
-            # If #1 is easy to outrank, the keyword is objectively easy
-            # regardless of what backfill apps appear below.
-            #
-            # Smooth log interpolation instead of step thresholds:
-            #   cap = 15 + 35 * log10(reviews+1) / log10(1001)
-            #     0 reviews → 15,  10 → 27,  50 → 35,
-            #   100 → 39, 500 → 47, 999 → 50
-            # Only applies when leader < 1000; above that no cap.
-            leader_cap = None
-            if leader_reviews < 1_000 and not is_brand_keyword:
-                leader_cap = int(
-                    15 + 35 * math.log10(leader_reviews + 1) / math.log10(1001)
-                )
-
-            if leader_cap is not None and total > leader_cap:
-                # When many competitors target this keyword (high
-                # match_ratio), the weak leader just means no dominant
-                # player *yet* — the field is still competitive.
-                # Blend between raw and capped score so the cap bites
-                # less when title matches are high:
-                #   match_ratio=0   → full cap (pure backfill)
-                #   match_ratio=0.5 → midpoint between raw and cap
-                #   match_ratio=1.0 → raw score kept as-is
-                if match_ratio > 0.2:
-                    total = int(leader_cap + (total - leader_cap) * match_ratio)
-                else:
-                    total = leader_cap
-                override_reason = "weak_leader"
-
-            # Signal 2: Backfill Discount
-            # When few competitors have the keyword in their title AND
-            # the leader is genuinely weak (< 1000 reviews), most
-            # results are generic backfill from broader search terms.
-            #
-            # Smooth ramp instead of binary 0.6× cutoff:
-            #   discount = 0.6 + 2.0 * match_ratio  (clamped to [0.6, 1.0])
-            # So match_ratio=0 → 0.6×, 0.1 → 0.8×, 0.2 → 1.0× (no discount).
-            # Leader strength further modulates: stronger leaders
-            # mean less discount via log interpolation.
-            if match_ratio < 0.2 and leader_reviews < 1_000 and not is_brand_keyword:
-                # Base discount from match ratio (smooth ramp)
-                ratio_factor = min(1.0, 0.6 + 2.0 * match_ratio)
-                # Leader strength factor: stronger leaders = less discount
-                leader_factor = math.log10(leader_reviews + 1) / math.log10(1001)
-                # Blend: at leader_factor=0 use full ratio_factor,
-                # at leader_factor=1 use no discount
-                discount = ratio_factor + (1.0 - ratio_factor) * leader_factor
-                discount = max(0.6, min(1.0, discount))
-                discounted = max(1, int(total * discount))
-                if discounted < total:
-                    total = discounted
-                    override_reason = "backfill"
+            total, leader_reason = self._leader_corrections(
+                total, leader_reviews=leader_reviews, match_ratio=match_ratio,
+                is_brand=is_brand_keyword,
+            )
+            if leader_reason:
+                override_reason = leader_reason
 
         total = max(1, min(100, total))
 
@@ -1636,9 +1979,9 @@ class DifficultyCalculator:
                     "icon": "🏷️",
                     "type": "info",
                     "text": (
-                        f"Brand keyword — '{kw_lower}' matches publisher "
+                        f"Brand keyword: '{kw_lower}' matches publisher "
                         f"{brand_name}. The #1 app ({leader_name}) has few "
-                        f"reviews because it's a brand companion app, not "
+                        f"ratings because it's a brand companion app, not "
                         f"because the keyword is easy. Difficulty reflects "
                         f"the full competitive landscape."
                     ),
@@ -1649,9 +1992,8 @@ class DifficultyCalculator:
         if override_reason and raw_total != total:
             if override_reason == "small_result_set":
                 override_text = (
-                    f"Score adjusted from {raw_total} → {total}. "
                     f"Only {n} app{'s' if n > 1 else ''} found for this "
-                    f"keyword — very little competition exists."
+                    f"keyword: very little competition exists."
                 )
             else:
                 leader_name = competitors[0].get("trackName", "#1 app")
@@ -1659,21 +2001,19 @@ class DifficultyCalculator:
                     # Many competitors target this keyword — not backfill,
                     # just a weak leader in a competitive field.
                     override_text = (
-                        f"Score adjusted from {raw_total} → {total}. "
                         f"The #1 app ({leader_name}) has only "
                         f"{leader_reviews:,} "
-                        f"review{'s' if leader_reviews != 1 else ''}, "
+                        f"rating{'s' if leader_reviews != 1 else ''}, "
                         f"but {title_match_count} of {n} competitors "
-                        f"target this keyword — real competition exists."
+                        f"target this keyword: real competition exists."
                     )
                 else:
                     override_text = (
-                        f"Score adjusted from {raw_total} → {total}. "
                         f"The #1 app ({leader_name}) has only "
                         f"{leader_reviews:,} "
-                        f"review{'s' if leader_reviews != 1 else ''}. "
+                        f"rating{'s' if leader_reviews != 1 else ''}. "
                         f"The remaining results are generic backfill "
-                        f"from broader search terms — not real "
+                        f"from broader search terms, not real "
                         f"competition for this specific keyword."
                     )
 
@@ -1752,6 +2092,54 @@ class DifficultyCalculator:
 
         return total, breakdown
 
+    def _leader_corrections(
+        self, total: int, *, leader_reviews: float, match_ratio: float,
+        is_brand: bool,
+    ) -> tuple[int, str | None]:
+        """The weak leader cap and the backfill discount, in one place.
+
+        Used by the overall score and by every ranking tier, which used to
+        carry their own copies.
+
+        Weak leader cap: a #1 app with few reviews caps difficulty. When many
+        competitors target the keyword the weak leader just means no dominant
+        player yet, so the cap bites in proportion to the backfill:
+        ``cap + (total - cap) * match_ratio``. It applies in full below
+        LEADER_CAP_FULL reviews and fades out by LEADER_CAP_GONE. It used to
+        switch off at exactly 1,000 reviews and to apply in full below a 20%
+        match ratio, both of which made difficulty jump.
+
+        Backfill discount: when few competitors have the keyword in their
+        title and the leader is weak, most results are backfill from broader
+        terms. Unchanged: it was already continuous at both edges.
+
+        Brand keywords get neither: Apple ranked those apps on purpose.
+        """
+        reason = None
+        if is_brand:
+            return total, reason
+
+        weight = leader_cap_weight(leader_reviews)
+        if weight > 0:
+            cap = leader_cap(leader_reviews)
+            if total > cap:
+                capped = cap + (total - cap) * match_ratio
+                adjusted = int(total - weight * (total - capped))
+                if adjusted < total:
+                    total = adjusted
+                    reason = "weak_leader"
+
+        if match_ratio < 0.2 and leader_reviews < LEADER_CAP_FULL:
+            ratio_factor = min(1.0, 0.6 + 2.0 * match_ratio)
+            leader_factor = math.log10(leader_reviews + 1) / math.log10(1001)
+            discount = ratio_factor + (1.0 - ratio_factor) * leader_factor
+            discount = max(0.6, min(1.0, discount))
+            discounted = max(1, int(total * discount))
+            if discounted < total:
+                total = discounted
+                reason = "backfill"
+        return total, reason
+
     def _compute_ranking_tiers(
         self,
         competitors: list[dict],
@@ -1780,9 +2168,8 @@ class DifficultyCalculator:
           - label: Easy / Moderate / Hard / Very Hard
           - highlights: list of plain-English bullet strings
         """
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         kw_lower = keyword.lower().strip()
-        kw_words = set(kw_lower.split()) if kw_lower else set()
         tiers = {}
 
         for tier_name, tier_size in [("top_5", 5), ("top_10", 10), ("top_20", 20)]:
@@ -1799,7 +2186,7 @@ class DifficultyCalculator:
                     "total_apps": 0,
                     "tier_score": 0,
                     "label": "Easy",
-                    "highlights": ["No competitors found — wide open."],
+                    "highlights": ["No competitors found: wide open."],
                 }
                 continue
 
@@ -1820,28 +2207,10 @@ class DifficultyCalculator:
             # This prevents e.g. "lan signer" tiers showing Hard
             # while overall shows Very Easy.
             if kw_lower and full_n >= 2:
-                # Weak leader cap (based on overall leader)
-                tier_cap = None
-                if overall_leader_reviews < 1_000 and not is_brand_keyword:
-                    tier_cap = int(
-                        15 + 35 * math.log10(overall_leader_reviews + 1) / math.log10(1001)
-                    )
-                if tier_cap is not None and tier_score > tier_cap:
-                    if overall_match_ratio > 0.2:
-                        tier_score = int(
-                            tier_cap
-                            + (tier_score - tier_cap) * overall_match_ratio
-                        )
-                    else:
-                        tier_score = tier_cap
-
-                # Backfill discount (based on overall match ratio)
-                if overall_match_ratio < 0.2 and overall_leader_reviews < 1_000 and not is_brand_keyword:
-                    ratio_factor = min(1.0, 0.6 + 2.0 * overall_match_ratio)
-                    leader_factor = math.log10(overall_leader_reviews + 1) / math.log10(1001)
-                    discount = ratio_factor + (1.0 - ratio_factor) * leader_factor
-                    discount = max(0.6, min(1.0, discount))
-                    tier_score = max(1, int(tier_score * discount))
+                tier_score, _ = self._leader_corrections(
+                    tier_score, leader_reviews=overall_leader_reviews,
+                    match_ratio=overall_match_ratio, is_brand=is_brand_keyword,
+                )
 
             tier_score = max(1, min(100, tier_score))
 
@@ -1882,7 +2251,7 @@ class DifficultyCalculator:
                 if release_date:
                     try:
                         released = datetime.fromisoformat(
-                            release_date.replace("Z", "+00:00")
+                            release_date
                         )
                         if (now - released).days < 365:
                             fresh += 1
@@ -1917,9 +2286,8 @@ class DifficultyCalculator:
         # this floor, tiers can appear inconsistently easier than the
         # overall score (e.g. overall "Very Hard" but tiers "Moderate").
         if overall_score > 0:
-            for tier_key in tiers:
-                if tiers[tier_key]["tier_score"] < overall_score:
-                    tiers[tier_key]["tier_score"] = overall_score
+            for tier in tiers.values():
+                tier["tier_score"] = max(tier["tier_score"], overall_score)
 
         # Re-label after floor enforcement
         def _score_to_label(s):
@@ -1935,10 +2303,8 @@ class DifficultyCalculator:
                 return "Very Hard"
             return "Extreme"
 
-        for tier_key in tiers:
-            tiers[tier_key]["label"] = _score_to_label(
-                tiers[tier_key]["tier_score"]
-            )
+        for tier in tiers.values():
+            tier["label"] = _score_to_label(tier["tier_score"])
 
         # --- Enforce monotonicity: larger tiers can never be harder ---
         # If Top 5 is Hard, Top 10 and Top 20 must also be Hard-or-easier.
@@ -1954,14 +2320,12 @@ class DifficultyCalculator:
             return label
 
         if "top_5" in tiers and "top_10" in tiers:
-            if tiers["top_10"]["tier_score"] > tiers["top_5"]["tier_score"]:
-                tiers["top_10"]["tier_score"] = tiers["top_5"]["tier_score"]
+            tiers["top_10"]["tier_score"] = min(tiers["top_10"]["tier_score"], tiers["top_5"]["tier_score"])
             tiers["top_10"]["label"] = _cap_label(
                 tiers["top_10"]["label"], tiers["top_5"]["label"]
             )
         if "top_10" in tiers and "top_20" in tiers:
-            if tiers["top_20"]["tier_score"] > tiers["top_10"]["tier_score"]:
-                tiers["top_20"]["tier_score"] = tiers["top_10"]["tier_score"]
+            tiers["top_20"]["tier_score"] = min(tiers["top_20"]["tier_score"], tiers["top_10"]["tier_score"])
             tiers["top_20"]["label"] = _cap_label(
                 tiers["top_20"]["label"], tiers["top_10"]["label"]
             )
@@ -1986,37 +2350,37 @@ class DifficultyCalculator:
         if n < tier_size:
             open_spots = tier_size - n
             highlights.append(
-                f"Only {n} app{'s' if n != 1 else ''} rank here "
-                f"— {open_spots} open spot{'s' if open_spots != 1 else ''}."
+                f"Only {n} app{'s' if n != 1 else ''} rank here, "
+                f"so {open_spots} spot{'s are' if open_spots != 1 else ' is'} open."
             )
             return highlights
 
         # Review barrier
         if min_reviews < 100:
             highlights.append(
-                f"The easiest app to beat has just {min_reviews:,} reviews."
+                f"The easiest app to beat has just {min_reviews:,} ratings."
             )
         elif min_reviews < 1_000:
             highlights.append(
-                f"You need ~{min_reviews:,}+ reviews to compete "
+                f"You need ~{min_reviews:,}+ ratings to compete "
                 f"(weakest: {weakest_app})."
             )
         elif min_reviews < 10_000:
             highlights.append(
-                f"You need ~{min_reviews:,}+ reviews to break in."
+                f"You need ~{min_reviews:,}+ ratings to break in."
             )
         else:
             highlights.append(
-                f"Requires ~{min_reviews:,}+ reviews — established market."
+                f"Requires ~{min_reviews:,}+ ratings: an established market."
             )
 
         # Weak spots
         if weak > 0:
             highlights.append(
-                f"{weak} of {n} apps have under 1K reviews — beatable."
+                f"{weak} of {n} apps have under 1K ratings: beatable."
             )
         else:
-            highlights.append("Every app here has 1K+ reviews — no easy targets.")
+            highlights.append("Every app here has 1K+ ratings: no easy targets.")
 
         # Fresh entrants
         if fresh > 0:
@@ -2028,7 +2392,7 @@ class DifficultyCalculator:
         # Title keyword usage
         if title_opt == 0:
             highlights.append(
-                "No app uses this exact keyword in its title — ASO opportunity!"
+                "No app uses this exact keyword in its title: an ASO opportunity!"
             )
         elif title_opt < n // 2:
             highlights.append(
@@ -2066,7 +2430,7 @@ class DifficultyCalculator:
                     "type": "barrier",
                     "text": (
                         f"{ultra} app{'s' if ultra > 1 else ''} with 1M+ "
-                        "reviews — dominated by major brands"
+                        "ratings: dominated by major brands"
                     ),
                 }
             )
@@ -2077,7 +2441,7 @@ class DifficultyCalculator:
                     "type": "barrier",
                     "text": (
                         f"{mega} app{'s' if mega > 1 else ''} with 100K+ "
-                        "reviews — strong incumbents"
+                        "ratings: strong incumbents"
                     ),
                 }
             )
@@ -2089,7 +2453,7 @@ class DifficultyCalculator:
                     "icon": "📊",
                     "type": "info",
                     "text": (
-                        f"Review distribution is skewed — median "
+                        f"Rating distribution is skewed: the median "
                         f"({median:,.0f}) is much lower than mean "
                         f"({avg:,.0f}). A few giants inflate the average."
                     ),
@@ -2104,7 +2468,7 @@ class DifficultyCalculator:
                     "type": "opportunity",
                     "text": (
                         "No competitors have this exact keyword in their "
-                        "title — potential title optimization gap"
+                        "title: a possible title optimization gap"
                     ),
                 }
             )
@@ -2138,7 +2502,7 @@ class DifficultyCalculator:
                     "icon": "⭐",
                     "type": "barrier",
                     "text": (
-                        f"High quality bar — avg rating is "
+                        f"High quality bar: the average rating is "
                         f"{avg_quality:.1f} stars. Users expect excellence."
                     ),
                 }
@@ -2153,7 +2517,7 @@ class DifficultyCalculator:
                     "type": "opportunity",
                     "text": (
                         f"{weak_count} of {n} competitors have <1,000 "
-                        "reviews — beatable with a quality app"
+                        "ratings: beatable with a quality app"
                     ),
                 }
             )
@@ -2215,24 +2579,24 @@ class DifficultyCalculator:
                         "Strong" if len(weak_apps) >= 3 else "Moderate"
                     ),
                     "detail": (
-                        f"{len(weak_apps)} of {n} apps have <1,000 reviews."
+                        f"{len(weak_apps)} of {n} apps have <1,000 ratings."
                         f" The weakest ({weakest.get('trackName', 'Unknown')})"
                         f" has only "
-                        f"{weakest.get('userRatingCount', 0):,} reviews — "
+                        f"{weakest.get('userRatingCount', 0):,} ratings: "
                         "these positions are displaceable."
                     ),
                 }
             )
 
         # Fresh entrants (released in last 12 months)
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         fresh_apps = []
         for c in competitors:
             release_date = c.get("releaseDate", "")
             if release_date:
                 try:
                     released = datetime.fromisoformat(
-                        release_date.replace("Z", "+00:00")
+                        release_date
                     )
                     if (now - released).days < 365:
                         fresh_apps.append(c)
@@ -2248,18 +2612,18 @@ class DifficultyCalculator:
                     "detail": (
                         f"{len(fresh_apps)} "
                         f"app{'s' if len(fresh_apps) > 1 else ''} launched "
-                        "in the last 12 months — this market is still "
+                        "in the last 12 months: this market is still "
                         "attracting new entrants."
                     ),
                 }
             )
 
         # Niche genre diversity
-        genres = set(
+        genres = {
             c.get("primaryGenreName", "")
             for c in competitors
             if c.get("primaryGenreName")
-        )
+        }
         if len(genres) >= 3:
             genre_list = ", ".join(sorted(genres)[:3])
             suffix = "..." if len(genres) > 3 else ""
@@ -2271,7 +2635,7 @@ class DifficultyCalculator:
                     "detail": (
                         f"Results span {len(genres)} genres "
                         f"({genre_list}{suffix}). The keyword isn't locked "
-                        "to one category — a well-positioned app in any "
+                        "to one category: a well-positioned app in any "
                         "genre could rank."
                     ),
                 }
@@ -2280,82 +2644,21 @@ class DifficultyCalculator:
         return signals
 
     def _rating_volume_score(self, median_ratings: float) -> float:
-        """
-        Map median rating count to a 0-100 score using log scale.
-
-        Uses median instead of mean to prevent outliers from skewing.
-        Calibrated for realistic App Store competition:
-          <50 median  → ~5   (ghost town)
-          <200 median → ~15  (very low competition)
-          <500 median → ~30  (indie-friendly)
-          <2,000      → ~50  (moderate, needs effort)
-          <5,000      → ~65  (competitive)
-          <10,000     → ~78  (hard)
-          <25,000     → ~88  (very hard)
-          <100,000    → ~95  (dominated)
-          ≥100,000    → 100  (impossible for indie)
-        """
-        if median_ratings <= 0:
-            return 0
-        if median_ratings >= 100_000:
-            return 100
-
-        # Logarithmic interpolation between calibration points
-        bands = [
-            (50, 5),
-            (200, 15),
-            (500, 30),
-            (2_000, 50),
-            (5_000, 65),
-            (10_000, 78),
-            (25_000, 88),
-            (100_000, 95),
-        ]
-
-        for i, (threshold, score) in enumerate(bands):
-            if median_ratings < threshold:
-                if i == 0:
-                    # Linear interpolation from 0 to first band
-                    return (median_ratings / threshold) * score
-                prev_threshold, prev_score = bands[i - 1]
-                ratio = math.log(median_ratings / prev_threshold) / math.log(
-                    threshold / prev_threshold
-                )
-                return prev_score + ratio * (score - prev_score)
-
-        return 100
+        """The rating volume sub-score. See rating_volume_score()."""
+        return rating_volume_score(median_ratings)
 
     def _review_velocity_score(self, competitors: list[dict]) -> float:
-        """
-        Calculate difficulty component from review velocity (reviews/year).
+        """The field's momentum: median ratings per year across competitors,
+        on the shared momentum curve (aso.strength.momentum_score)."""
+        from .strength import _utcnow, momentum_score, ratings_per_year, years_since
 
-        Uses median velocity across competitors, log-scaled.
-        Distinguishes active, growing markets from stagnant ones.
-
-        Calibration:
-          <10/yr   → ~5   (dead apps)
-          <50/yr   → ~15  (minimal traction)
-          <200/yr  → ~30  (slow growth)
-          <1000/yr → ~50  (moderate, indie-level)
-          <5000/yr → ~70  (solid growth)
-          <20000/yr→ ~85  (strong growth)
-          <50000/yr→ ~95  (top-charts velocity)
-          ≥50000/yr→ 100  (viral / premium)
-        """
-        now = datetime.now(timezone.utc)
+        now = _utcnow()
         velocities = []
         for c in competitors:
             reviews = c.get("userRatingCount", 0)
-            release_date = c.get("releaseDate", "")
-            if release_date and reviews > 0:
-                try:
-                    released = datetime.fromisoformat(
-                        release_date.replace("Z", "+00:00")
-                    )
-                    age_years = max(0.5, (now - released).days / 365.25)
-                    velocities.append(reviews / age_years)
-                except (ValueError, TypeError):
-                    pass
+            years = years_since(c.get("releaseDate", ""), now)
+            if years is not None and reviews > 0:
+                velocities.append(ratings_per_year(reviews, years))
 
         if not velocities:
             return 50  # default mid-range
@@ -2367,129 +2670,25 @@ class DifficultyCalculator:
             median_vel = velocities[vn // 2]
         else:
             median_vel = (velocities[vn // 2 - 1] + velocities[vn // 2]) / 2
-
-        if median_vel <= 0:
-            return 0
-        if median_vel >= 50_000:
-            return 100
-
-        bands = [
-            (10, 5),
-            (50, 15),
-            (200, 30),
-            (1_000, 50),
-            (5_000, 70),
-            (20_000, 85),
-            (50_000, 95),
-        ]
-
-        for i, (threshold, score) in enumerate(bands):
-            if median_vel < threshold:
-                if i == 0:
-                    return (median_vel / threshold) * score
-                prev_threshold, prev_score = bands[i - 1]
-                ratio = math.log(median_vel / prev_threshold) / math.log(
-                    threshold / prev_threshold
-                )
-                return prev_score + ratio * (score - prev_score)
-
-        return 100
+        return momentum_score(median_vel)
 
     def _rating_quality_score(self, avg_quality: float) -> float:
-        """
-        Map average rating quality to a 0-100 normalized score.
+        """The field's rating, on the shared curve (aso.strength.rating_score)."""
+        from .strength import rating_score
 
-        Higher avg ratings = harder to compete = higher score.
-        Uses smooth linear interpolation between calibration points
-        instead of discrete steps.
-
-        Calibration:
-          0.0 → 0
-          3.0 → 20
-          3.5 → 35
-          4.0 → 50
-          4.3 → 70
-          4.5 → 85
-          5.0 → 100
-        """
-        if avg_quality <= 0:
-            return 0
-        if avg_quality >= 5.0:
-            return 100
-
-        bands = [
-            (0.0, 0),
-            (3.0, 20),
-            (3.5, 35),
-            (4.0, 50),
-            (4.3, 70),
-            (4.5, 85),
-            (5.0, 100),
-        ]
-
-        for i in range(1, len(bands)):
-            threshold, score = bands[i]
-            if avg_quality < threshold:
-                prev_threshold, prev_score = bands[i - 1]
-                ratio = (avg_quality - prev_threshold) / (
-                    threshold - prev_threshold
-                )
-                return prev_score + ratio * (score - prev_score)
-
-        return 100
+        return rating_score(avg_quality)
 
     def _market_age_score(self, competitors: list[dict]) -> float:
-        """
-        Map average market age to a 0-100 normalized score.
+        """The field's age: mean years on the store, on the shared curve
+        (aso.strength.age_score). Older fields are more entrenched."""
+        from .strength import _utcnow, age_score, years_since
 
-        Older markets = more entrenched = harder to enter.
-          <1 year → 20
-          1-2 years → 35
-          2-3 years → 50
-          3-5 years → 70
-          5-8 years → 85
-          >8 years → 100
-        """
-        now = datetime.now(timezone.utc)
-        ages = []
-        for c in competitors:
-            release_date = c.get("releaseDate", "")
-            if release_date:
-                try:
-                    released = datetime.fromisoformat(
-                        release_date.replace("Z", "+00:00")
-                    )
-                    age_years = (now - released).days / 365.25
-                    ages.append(age_years)
-                except (ValueError, TypeError):
-                    pass
-
+        now = _utcnow()
+        ages = [
+            years for years in (years_since(c.get("releaseDate", ""), now) for c in competitors)
+            if years is not None
+        ]
         if not ages:
             return 50  # default mid-range
+        return age_score(sum(ages) / len(ages))
 
-        avg_age = sum(ages) / len(ages)
-
-        # Smooth linear interpolation between calibration points
-        # (consistent with _rating_volume_score, _review_velocity_score).
-        if avg_age <= 0:
-            return 0
-        if avg_age >= 10:
-            return 100
-
-        age_bands = [
-            (0.5, 10),
-            (1.0, 20),
-            (2.0, 35),
-            (3.0, 50),
-            (5.0, 70),
-            (8.0, 85),
-            (10.0, 100),
-        ]
-        for i, (threshold, score) in enumerate(age_bands):
-            if avg_age < threshold:
-                if i == 0:
-                    return (avg_age / threshold) * score
-                prev_t, prev_s = age_bands[i - 1]
-                ratio = (avg_age - prev_t) / (threshold - prev_t)
-                return prev_s + ratio * (score - prev_s)
-        return 100

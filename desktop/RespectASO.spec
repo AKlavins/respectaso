@@ -38,6 +38,74 @@ shared_datas = [
     (str(BASE_DIR / "licensing" / "public_key.pem"), "licensing"),
 ] + copy_metadata("fastmcp")
 
+# Our own packages go in whole, found by walking their files rather than
+# listed by hand. Django reaches some modules only through dotted strings in
+# settings and urls (handler404, CSRF_FAILURE_VIEW, middleware, context
+# processors), which PyInstaller cannot follow, and a hand list misses every
+# new file: the first 2.28.0 build left out aso.error_views, so every 404
+# crashed. (PyInstaller's collect_submodules cannot import our packages from
+# here and quietly returns nothing, so the walk is ours.) Tests stay out;
+# migrations ship as source files through shared_datas. After analysis the
+# build stops if any of these modules did not make it into the bundle.
+# desktop is ours too, but only the Mac app's window process uses it: it
+# goes into the GUI analysis alone (GUI_ONLY_MODULES), never the MCP binary.
+FIRST_PARTY = ["core", "aso", "aso_pro", "licensing", "llm_providers", "desktop"]
+
+
+def _is_shipped(name):
+    parts = name.split(".")
+    return not any(
+        part in ("tests", "migrations") or part.startswith("test_") for part in parts
+    )
+
+
+def _own_modules(package):
+    # The public repo has no aso_pro, licensing or llm_providers.
+    root = BASE_DIR / package
+    if not (root / "__init__.py").exists():
+        return []
+    modules = []
+    for path in sorted(root.rglob("*.py")):
+        if not (path.parent / "__init__.py").exists():
+            continue
+        parts = path.relative_to(BASE_DIR).with_suffix("").parts
+        if parts[-1] == "__init__":
+            parts = parts[:-1]
+        name = ".".join(parts)
+        if _is_shipped(name):
+            modules.append(name)
+    return modules
+
+
+OWN_MODULES = [
+    module for package in FIRST_PARTY if package != "desktop" for module in _own_modules(package)
+]
+
+
+def _require_modules(analysis, names, what):
+    bundled = {name for name, *_ in analysis.pure}
+    missing = sorted(set(names) - bundled)
+    if missing:
+        raise SystemExit(f"{what} missing from the bundle: " + ", ".join(missing))
+
+
+def _require_own_modules(analysis):
+    _require_modules(analysis, OWN_MODULES, "Modules of ours")
+
+
+# The Mac app's native side and the macOS frameworks it imports lazily
+# (desktop/mac_integration.py): the menu bar, the login item, notifications.
+# GUI only: the MCP binary never shows a window. desktop/main.py imports
+# mac_integration inside main(), so it is listed here and checked after
+# analysis like our own modules.
+GUI_ONLY_MODULES = [
+    "desktop",
+    "desktop.mac_integration",
+    "ServiceManagement",
+    "UserNotifications",
+]
+
+
 shared_hiddenimports = [
         # Django core
         "django",
@@ -52,57 +120,6 @@ shared_hiddenimports = [
         "whitenoise.middleware",
         "dotenv",
         "certifi",
-        # Core app
-        "core.settings",
-        "core.urls",
-        "core.wsgi",
-        "core.context_processors",
-        # Free features (aso)
-        "aso",
-        "aso.apps",
-        "aso.models",
-        "aso.views",
-        "aso.urls",
-        "aso.scoring",
-        "aso.services",
-        "aso.scheduler",
-        "aso.templatetags",
-        "aso.templatetags.aso_tags",
-        # Pro features (aso_pro)
-        "aso_pro",
-        "aso_pro.apps",
-        "aso_pro.models",
-        "aso_pro.views",
-        "aso_pro.urls",
-        "aso_pro.researcher",
-        "aso_pro.competitor_analyzer",
-        "aso_pro.simulator",
-        "aso_pro.agents",
-        "aso_pro.constraints",
-        "aso_pro.keyword_pipeline",
-        "aso_pro.prompts",
-        "aso_pro.schemas",
-        "aso_pro.metadata_evaluator",
-        "aso_pro.settings_storage",
-        # LLM providers
-        "llm_providers",
-        "llm_providers.base",
-        "llm_providers.factory",
-        "llm_providers.openai_provider",
-        "llm_providers.anthropic_provider",
-        "llm_providers.gemini_provider",
-        "llm_providers.openrouter_provider",
-        "llm_providers.local_provider",
-        "llm_providers.structured_json",
-        "llm_providers.model_catalog",
-        "llm_providers.token_counter",
-        # Licensing
-        "licensing",
-        "licensing.apps",
-        "licensing.decorators",
-        "licensing.middleware",
-        "licensing.storage",
-        "licensing.validator",
         # Third-party LLM SDKs
         "openai",
         "anthropic",
@@ -118,25 +135,14 @@ shared_hiddenimports = [
         # MCP server
         "fastmcp",
         "mcp",
-        "aso_pro.mcp",
-        "aso_pro.mcp.bootstrap",
-        "aso_pro.mcp.server",
-        "aso_pro.mcp.license_gate",
-        "aso_pro.mcp.tools",
-        "aso_pro.mcp.tools.free",
-        "aso_pro.mcp.tools.researcher",
-        "aso_pro.mcp.tools.competitor",
-        "aso_pro.mcp.tools.simulator",
-        "aso_pro.mcp.tools.sessions",
-        "aso_pro.mcp.tools.utilities",
-    ]
+    ] + OWN_MODULES
 
 a = Analysis(
     [str(BASE_DIR / "desktop" / "main.py")],
     pathex=[str(BASE_DIR)],
     binaries=[],
     datas=shared_datas,
-    hiddenimports=shared_hiddenimports,
+    hiddenimports=shared_hiddenimports + GUI_ONLY_MODULES,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -146,6 +152,9 @@ a = Analysis(
     cipher=block_cipher,
     noarchive=False,
 )
+
+_require_own_modules(a)
+_require_modules(a, GUI_ONLY_MODULES, "Mac app modules")
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
@@ -184,6 +193,8 @@ mcp_a = Analysis(
     cipher=block_cipher,
     noarchive=False,
 )
+
+_require_own_modules(mcp_a)
 
 # De-duplicate shared binaries/datas between GUI and MCP analyses
 for d in a.datas:

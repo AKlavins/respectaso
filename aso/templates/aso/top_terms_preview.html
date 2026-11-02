@@ -1,0 +1,33 @@
+{% extends "aso/base.html" %}
+{% load static %}
+{% comment %}
+The Top Search Terms tab whenever the live page cannot render yet:
+the free edition, a Pro install without a valid license, or a licensed
+install whose Apple Ads connection is missing or has not synced a week.
+Context comes from aso.top_terms_preview.preview_context(state): the
+hero explains why it is a preview and what fixes that; the sample-data
+preview below shows the actual page with the search terms blurred.
+{% endcomment %}
+
+{% block title %}Top Search Terms · RespectASO{% endblock %}
+
+{% block content %}
+<div class="w-full">
+    {% include "aso/partials/section_tabs.html" with section="discover" %}
+
+    <div class="mb-4">
+        <h1 class="page-title mb-1">Top Search Terms</h1>
+        <p class="page-lead">
+            Apple's top 500 search terms per category, every week. Track a term or research it in one click.
+        </p>
+    </div>
+
+    {% include "aso/partials/preview_hero.html" with cta=preview.cta %}
+
+    {% include "aso/partials/top_terms_preview.html" %}
+
+    {% include "aso/partials/preview_footer.html" with cta=preview.cta %}
+</div>
+<script src="{% static 'js/sparkline.js' %}"></script>
+<script>renderSparklines(document);</script>
+{% endblock %}

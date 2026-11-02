@@ -7,10 +7,13 @@
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)
 [![macOS](https://img.shields.io/badge/macOS-Download_.dmg-purple?logo=apple&logoColor=white)](https://github.com/respectlytics/respectaso/releases/latest)
 [![Version](https://img.shields.io/github/v/release/respectlytics/respectaso?color=purple&label=version)](https://github.com/respectlytics/respectaso/releases/latest)
+[![Website](https://img.shields.io/badge/Website-respectaso.com-purple)](https://respectaso.com)
 
-**Free, open-source ASO keyword research tool for macOS. No API keys. No accounts. No data leaves your machine.**
+**Free, open-source ASO keyword research tool for macOS. No API keys. No accounts. Your research stays on your Mac.**
 
-RespectASO helps iOS developers research App Store keywords privately. Download the `.dmg`, drag to Applications, and get keyword popularity scores, difficulty analysis, competitor breakdowns, and download estimates — all without sending your research data to third-party services.
+RespectASO helps iOS developers research App Store keywords privately. Download the `.dmg`, drag to Applications, and get keyword popularity scores, difficulty analysis, competitor breakdowns, and download estimates, and your research is stored on your Mac, never on a server of ours.
+
+**Website:** [respectaso.com](https://respectaso.com) has the docs, the scoring methodology and RespectASO Pro.
 
 ---
 
@@ -18,34 +21,34 @@ RespectASO helps iOS developers research App Store keywords privately. Download 
 
 Most ASO tools require paid subscriptions, API keys, and send your keyword research to their servers. RespectASO takes a different approach:
 
-- **No API keys or credentials needed** — uses only the public iTunes Search API
-- **Runs entirely on your machine** — all API calls originate from your local network
-- **No telemetry, no analytics, no tracking** — zero data sent to any third party
-- **Free and open-source** — AGPL-3.0 licensed, forever
-- **Native Mac app** — download the `.dmg`, drag to Applications, done
+- **No API keys or credentials needed**: works out of the box with the public iTunes Search API; connecting Apple Ads for official popularity data is optional
+- **Runs on your Mac**: App Store data comes from Apple straight to your computer, never through a server of ours
+- **No telemetry, no analytics, no tracking**: the app reports nothing about you or your research to us or anyone else
+- **Free and open-source**: AGPL-3.0 licensed, forever
+- **Native Mac app**: download the `.dmg`, drag to Applications, done
 
 ## Features
 
 | Feature | Description |
 |---------|-------------|
-| **Keyword Popularity** | Estimated popularity scores (1–100) based on analysis of iTunes Search API competitor data |
+| **Keyword Popularity** | Popularity scores (1-100): a built-in estimate calibrated against Apple's official search-popularity data, or (optionally) Apple's own weekly values via your Apple Ads connection |
 | **Difficulty Score** | Competition difficulty analysis across multiple factors with ranking tier breakdowns for Top 5, Top 10, and Top 20 |
-| **Ranking Tiers** | Separate difficulty analysis for Top 5, Top 10, and Top 20 positions — because breaking into the top 5 is different from reaching the top 20 |
+| **Ranking Tiers** | Separate difficulty analysis for Top 5, Top 10, and Top 20 positions, because breaking into the top 5 is different from reaching the top 20 |
 | **Download Estimates** | Estimated daily downloads per ranking position based on search volume, tap-through rates, and conversion rates |
 | **Competitor Analysis** | See the top 10 apps ranking for each keyword with ratings, reviews, genre, release date, and direct App Store links |
-| **Country Opportunity Finder** | Scan up to 30 App Store regions at once to find which countries offer the best ranking opportunities for your keyword |
-| **Multi-Keyword Search** | Research up to 20 keywords at once (comma-separated) |
+| **Country Opportunity Finder** | Scan all 175 App Store storefronts, or the ones you pick, to find which countries offer the best ranking opportunities for your keyword |
+| **Multi-Keyword Search** | Research several keywords at once (comma-separated): 3 per search in the free edition, up to 1,000 with Pro |
 | **Multi-Country Search** | Search the same keyword across multiple countries simultaneously |
 | **App Rank Tracking** | Add your apps and see where you rank for each keyword alongside competitor data |
 | **Search History** | Browse past keyword research with sorting, filtering, and expandable detail views |
 | **CSV Export** | Export your keyword research data for use in spreadsheets |
-| **ASO Targeting Advice** | Automatic keyword classification (Sweet Spot, Good Target, Hidden Gem, High Competition, Moderate, Low Volume, Avoid) based on opportunity scoring |
+| **ASO Targeting Advice** | Automatic keyword classification (Sweet Spot, Good Target, Supporting, Worth Climbing, Low Volume) based on opportunity scoring |
 
 ## Quick Start
 
 ### 1. Download
 
-**→ [Download RespectASO.dmg](https://github.com/respectlytics/respectaso/releases/latest)** (macOS 12+, Apple Silicon)
+**[Download RespectASO.dmg](https://github.com/respectlytics/respectaso/releases/latest)** (macOS 12+, Apple Silicon)
 
 ### 2. Install
 
@@ -53,13 +56,13 @@ Open the `.dmg` and drag **RespectASO** into your **Applications** folder.
 
 ### 3. Launch
 
-Open RespectASO from Applications (or Spotlight: ⌘ Space → "RespectASO"). The app window opens automatically — type a keyword, select a country, and click Search.
+Open RespectASO from Applications (or Spotlight: ⌘ Space → "RespectASO"). The app window opens automatically: type a keyword, select a country, and click Search.
 
-> **First launch:** If macOS shows a security dialog, right-click the app → Open → Open. This is only needed once — the app is code-signed and notarized by Apple.
+> **First launch:** If macOS shows a security dialog, right-click the app → Open → Open. This is only needed once; the app is code-signed and notarized by Apple.
 
 ### Updating
 
-When an update is available, a banner appears on the Dashboard with release notes and a **Download Update** button. Download the new `.dmg`, drag to Applications (replace the old version), and relaunch. Your data is preserved — it lives in `~/Library/Application Support/RespectASO/`, separate from the app bundle.
+When an update is available, a banner appears on the Dashboard with release notes and a **Download Update** button. Download the new `.dmg`, drag to Applications (replace the old version), and relaunch. Your data is preserved: it lives in `~/Library/Application Support/RespectASO/`, separate from the app bundle.
 
 ### Data Location
 
@@ -119,21 +122,21 @@ docker compose down -v  # Also remove the volume (only after confirming native a
 
 ## How Scoring Works
 
-RespectASO uses the **iTunes Search API** as its only data source — no Apple Search Ads credentials, no scraping, no paid APIs.
+RespectASO uses the public **iTunes Search API** plus, when you choose to connect it, the official **Apple Ads Platform API** with your own free API key. If Apple's search API fails, RespectASO reads the same search on Apple's public App Store search page instead, takes only the list of apps in Apple's order, and looks up their details through the iTunes Search API as usual. No private APIs, no paid data services.
 
-### Popularity Score (1–100)
+### Popularity Score (1-100)
 
 Estimates how frequently a keyword is searched by analyzing multiple signals from iTunes Search results, including the number and quality of competing apps, keyword relevance patterns, and market depth. Higher scores mean more people are searching for that keyword.
 
-### Difficulty Score (1–100)
+### Difficulty Score (1-100)
 
 Estimates how hard it would be to rank for a keyword by evaluating competition strength across factors like existing app ratings, market dominance, publisher diversity, and content relevance.
 
-**Tiers:** Very Easy (&lt;16) · Easy (16–35) · Moderate (36–55) · Hard (56–75) · Very Hard (76–90) · Extreme (91+)
+**Tiers:** Very Easy (&lt;16) · Easy (16-35) · Moderate (36-55) · Hard (56-75) · Very Hard (76-90) · Extreme (91+)
 
 ### Download Estimates
 
-Estimates daily downloads per ranking position based on search volume, expected tap-through rates by position, and install conversion rates. Results are shown as conservative–optimistic ranges with tier breakdowns for Top 5, Top 6–10, and Top 11–20.
+Estimates daily downloads per ranking position based on search volume, expected tap-through rates by position, and install conversion rates. Results are shown as ranges with tier breakdowns for Top 5, Top 6-10, and Top 11-20.
 
 For full methodology details, visit the **Methodology** page inside the app or explore the [source code](https://github.com/respectlytics/respectaso).
 
@@ -156,30 +159,36 @@ The `.private` TLD is reserved by [RFC 6762](https://www.rfc-editor.org/rfc/rfc6
 
 ## Tech Stack
 
-- **Python 3.12** + **Django 5.1**
-- **pywebview** — native macOS WebKit window
-- **SQLite** — local single-user database
-- **wsgiref** — built-in Python WSGI server
-- **WhiteNoise** — efficient static file serving
-- **Tailwind CSS** (compiled locally, no CDN - styling works offline) - dark theme UI
-- **PyInstaller** — macOS `.app` bundle
+- **Python 3.12** + **Django 5.2**
+- **pywebview**: native macOS WebKit window
+- **SQLite**: local single-user database
+- **wsgiref**: built-in Python WSGI server
+- **WhiteNoise**: efficient static file serving
+- **Tailwind CSS**: dark theme UI, compiled locally with no CDN, so styling works offline
+- **PyInstaller**: macOS `.app` bundle
 
 ## Privacy
 
 RespectASO is designed with privacy as a core principle:
 
-- **100% local** — the tool runs entirely on your machine as a native app
-- **No accounts** — no registration, no login, no user tracking
-- **No telemetry** — zero analytics, zero phone-home, zero data collection
-- **No API keys** — uses only the public iTunes Search API (no credentials required)
-- **No third-party services** — all API calls go directly from your machine to Apple's public API
-- **Your data stays yours** — keyword research, competitor analysis, and search history never leave your network
+- **A native Mac app**: it runs on your machine and keeps your research there
+- **No accounts**: no registration, no login, no user tracking
+- **No telemetry**: no analytics and no data collection. The app's only calls go to Apple, for App Store data, and to GitHub, to see whether a new version is out
+- **No API keys required**: the public iTunes Search API needs no credentials; the optional Apple Ads connection uses your own key, which stays on your Mac
+- **No middleman**: App Store data comes straight from Apple to your machine, never through a RespectASO server
+- **Your data stays yours**: keyword research, competitor analysis and search history are stored on your Mac, not on any server of ours
 
 We built RespectASO because we believe developers should be able to research keywords without handing their competitive intelligence to a third party.
 
+## Our other products
+
+- [Respectlytics](https://respectlytics.com/?ref=respectaso-github): privacy-first mobile app analytics for iOS and Android that finds your conversion paths and drop-offs from five fields per event, with no user IDs and no device IDs.
+- [Prokoll](https://prokoll.com/?ref=respectaso-github): private meeting notes that stay on your Mac, with who said what, and no account, no cloud and no bot in the call.
+- [Therese AI](https://thereseai.com/?ref=respectaso-github): daily content intelligence for a business's marketing, turning the news from the authorities and trade press in your field into post ideas, each with its source.
+
 ## License
 
-[AGPL-3.0](LICENSE) — free to use, modify, and distribute. If you modify and deploy RespectASO as a service, you must share your changes under the same license.
+[AGPL-3.0](LICENSE): free to use, modify, and distribute. If you modify and deploy RespectASO as a service, you must share your changes under the same license.
 
 ## Contributing
 
@@ -195,4 +204,4 @@ See [SECURITY.md](SECURITY.md) for reporting vulnerabilities.
 
 ---
 
-**Built by [Respectlytics](https://respectlytics.com/?utm_source=respectaso&utm_medium=readme&utm_campaign=oss)** — Privacy-focused mobile analytics for iOS & Android. We help developers avoid collecting personal data in the first place.
+**Built by [Respectlytics](https://respectlytics.com/?ref=respectaso-github)**: privacy-focused mobile analytics for iOS & Android. We help developers avoid collecting personal data in the first place.

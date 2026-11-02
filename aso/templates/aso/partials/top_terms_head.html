@@ -1,0 +1,27 @@
+{% load aso_tags %}
+{% comment %}
+Column headers of the Top Search Terms table, with their explainers.
+ONE copy, included by the live page (aso_pro/top_terms.html) and by the
+sample-data preview (partials/top_terms_preview.html), so the preview can
+never drift from the real column set and the tooltip copy stays in sync.
+`locked` (the preview) leaves out the (i) tips, which nobody can use there.
+
+Only Rank and Popularity carry an (i): the other headings say what they
+are (UI_REDESIGN_PLAN.md 7.3). Apple's 1 to 5 tier and the popularity
+within the category live in each popularity cell's hover. The last column
+holds Track and Research, which show on row hover and keyboard focus.
+{% endcomment %}
+<thead>
+    <tr class="text-left text-2xs uppercase tracking-wide text-slate-400 border-b border-white/5">
+        <th class="px-4 py-2">
+            <span class="inline-flex items-center gap-1">Rank {% if not locked %}{% info_tip "#1 is the most-searched term in its App Store category, in this storefront this week." %}{% endif %}</span>
+        </th>
+        <th class="px-4 py-2">Search term</th>
+        <th class="px-4 py-2">Category</th>
+        <th class="px-4 py-2 text-center">
+            <span class="inline-flex items-center gap-1">Popularity {% if not locked %}{% info_tip "Apple's popularity from 1 to 100 across the whole storefront." %}{% endif %}</span>
+        </th>
+        <th class="px-4 py-2 text-center">Trend</th>
+        <th class="px-4 py-2"><span class="sr-only">Track or research</span></th>
+    </tr>
+</thead>

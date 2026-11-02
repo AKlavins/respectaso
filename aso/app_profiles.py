@@ -1,0 +1,334 @@
+"""What the App Store shows about each of your apps, per storefront, kept fresh.
+
+The opportunity score is for the app a keyword is tracked for, measured on the
+same yardstick as the competitors (aso/strength.py): its rating count, its
+average rating, its momentum (ratings per year) and its age. Apple counts
+ratings per storefront, so the profile is per storefront too: an app with
+12,000 ratings in the United States may have 40 in Bulgaria.
+
+This module is the only reader and writer of ``App.store_profiles``, shaped
+``{code: {"count": int, "average": float | None, "released": iso8601,
+"genre": str, "checked_at": iso8601}}``. ``genre`` is the app's App Store
+category, which the AI tabs compare with a niche's (``app_category``):
+
+
+    cached_profile()        read, no network; every read-time score uses it,
+                            so all rows of one app in one storefront agree
+    profile_in_storefront() refresh through one iTunes lookup when the value
+                            is older than PROFILE_MAX_AGE; called by the
+                            scoring pipeline whenever it scores for an app
+    profile_for_track()     the same for a bare track id, for the Simulator,
+                            which can run for an app you do not track
+    record_lookup()         store a profile from a lookup another feature
+                            already made, so the app is not read twice a day
+    known_storefronts()     the storefronts the app is known in, for a lookup
+                            that must find its listing (the Apps page refresh)
+    backfill_from_history() once, at upgrade, from stored competitor lists
+    app_category()          the app's App Store category, as last read
+
+Free-tier module: no aso_pro, licensing or llm_providers import.
+"""
+
+from __future__ import annotations
+
+import logging
+from datetime import UTC, datetime, timedelta
+
+from .strength import AppProfile
+
+logger = logging.getLogger(__name__)
+
+PROFILE_MAX_AGE = timedelta(hours=24)
+
+# How old a Dashboard rank may be and still count for a picked app on the AI
+# tabs: a week, the span over which a daily refreshed rank stays a fair guide.
+KNOWN_RANK_MAX_AGE = timedelta(days=7)
+
+
+def _now() -> datetime:
+    return datetime.now(UTC)
+
+
+def _parse(stamp: str | None) -> datetime | None:
+    if not stamp:
+        return None
+    try:
+        return datetime.fromisoformat(stamp)
+    except ValueError:
+        return None
+
+
+def _entry(app, country: str) -> dict:
+    return (getattr(app, "store_profiles", None) or {}).get((country or "").lower()) or {}
+
+
+def cached_profile(app, country: str) -> AppProfile | None:
+    """The app's profile in one storefront, as last read.
+
+    None for no app. An app never read in this storefront gets a profile
+    marked unknown, so the score treats it as a brand new app and the
+    sentence names the app and says its ratings have not been read.
+    """
+    if app is None:
+        return None
+    entry = _entry(app, country)
+    if entry.get("count") is None:
+        return AppProfile(name=app.name, known=False)
+    return AppProfile(
+        name=app.name,
+        ratings=int(entry["count"]),
+        average=entry.get("average"),
+        released=entry.get("released"),
+    )
+
+
+def _is_fresh(app, country: str) -> bool:
+    entry = _entry(app, country)
+    checked = _parse(entry.get("checked_at"))
+    # A profile stored before the category was kept is read again once.
+    return "genre" in entry and checked is not None and _now() - checked < PROFILE_MAX_AGE
+
+
+def known_storefronts(app) -> list[str]:
+    """The storefronts the app is known in, most telling first: the one its
+    App Store link names (where it was added from), then the ones its
+    profile was read in, the most recently read first; ["us"] when none is
+    known. No App Store call. Apple lists many apps in only some
+    storefronts, so a lookup that must find the app's listing asks these,
+    never the United States by default."""
+    from . import countries
+    from .services import ITunesSearchService
+
+    profiles = [
+        (code, entry.get("checked_at") or "")
+        for code, entry in (getattr(app, "store_profiles", None) or {}).items()
+        if isinstance(entry, dict)
+    ]
+    profiles.sort(key=lambda item: item[1], reverse=True)
+    linked = ITunesSearchService.storefront_in_link(getattr(app, "store_url", "") or "")
+    return countries.clean([linked, *(code for code, _checked in profiles)]) or ["us"]
+
+
+def app_category(app) -> str:
+    """The app's App Store category ("Productivity"), as last read in any
+    storefront; "" when it has not been read. Apple gives an app one primary
+    category everywhere."""
+    for entry in (getattr(app, "store_profiles", None) or {}).values():
+        if isinstance(entry, dict) and entry.get("genre"):
+            return entry["genre"]
+    return ""
+
+
+def _store(app, country: str, found: dict, checked_at: datetime | None = None) -> bool:
+    """Write one storefront's profile. True when anything the score reads
+    changed."""
+    from .models import App
+
+    code = (country or "").lower()
+    data = dict(app.store_profiles or {})
+    previous = data.get(code) or {}
+    data[code] = {
+        "count": int(found["count"]),
+        "average": found.get("average"),
+        "released": found.get("released"),
+        "genre": found.get("genre") or "",
+        "checked_at": (checked_at or _now()).isoformat(),
+    }
+    app.store_profiles = data
+    # An update, not save(): the app can be deleted while a search for it is
+    # still running, and a missing row must not fail that search.
+    if not App.objects.filter(pk=app.pk).update(store_profiles=data):
+        return False
+    return any(previous.get(k) != data[code][k] for k in ("count", "average", "released"))
+
+
+def _from_result(found) -> dict | None:
+    """A profile from a Lookup API result, raw or parsed (both carry the
+    same keys), or None when it has no rating count."""
+    if not isinstance(found, dict):
+        return None
+    count = found.get("userRatingCount") or 0
+    if not isinstance(count, (int, float)):
+        return None
+    average = found.get("averageUserRating")
+    released = found.get("releaseDate")
+    name = found.get("trackName")
+    genre = found.get("primaryGenreName")
+    return {
+        "count": int(count),
+        "average": float(average) if isinstance(average, (int, float)) else None,
+        "released": released if isinstance(released, str) else None,
+        "name": name if isinstance(name, str) else None,
+        "genre": genre if isinstance(genre, str) else "",
+    }
+
+
+def _lookup(track_id: int, country: str, itunes_service) -> dict | None:
+    # One call, no retries: a profile lookup sits inside keyword scoring,
+    # which paces its own App Store reads. When Apple cannot be reached or
+    # has no listing here, the last known profile stands and the next
+    # scoring that needs the profile asks again.
+    try:
+        found = itunes_service.lookup_by_id(int(track_id), country=country, retry=False)
+    except Exception as exc:  # noqa: BLE001 (a failed lookup never fails a scoring run)
+        logger.warning("Profile lookup failed for %s in %s: %s", track_id, country, exc)
+        return None
+    return _from_result(found)
+
+
+def profile_in_storefront(app, country: str, *, itunes_service) -> AppProfile | None:
+    """The app's profile in one storefront, refreshed at most daily.
+
+    A failed lookup keeps the last known profile. When what the score reads
+    changes, the stored labels of that app's rows in that storefront are
+    recomputed, so the insight filter and the badges follow at once.
+    """
+    if app is None:
+        return None
+    if not getattr(app, "track_id", None) or _is_fresh(app, country):
+        return cached_profile(app, country)
+    found = _lookup(app.track_id, country, itunes_service)
+    if found is None:
+        return cached_profile(app, country)
+    if _store(app, country, found):
+        reclassify(app, country)
+    return cached_profile(app, country)
+
+
+def record_lookup(app, country: str, found: dict) -> bool:
+    """Store a profile from a Lookup API result another feature already
+    fetched (the Rival Tracker reads every app of a storefront in one call),
+    so the app is not looked up a second time that day. True when anything
+    the score reads changed; the app's rows are then relabelled, as after
+    profile_in_storefront."""
+    if app is None:
+        return False
+    parsed = _from_result(found)
+    if parsed is None:
+        return False
+    changed = _store(app, country, parsed)
+    if changed:
+        reclassify(app, country)
+    return changed
+
+
+def profile_for_track(track_id, country: str, *, itunes_service) -> AppProfile | None:
+    """A profile for a bare track id: the tracked app's cache when it is one
+    of yours, otherwise a direct lookup that is not stored."""
+    if not track_id:
+        return None
+    from .models import App
+
+    app = App.objects.filter(track_id=int(track_id)).first()
+    if app is not None:
+        return profile_in_storefront(app, country, itunes_service=itunes_service)
+    found = _lookup(int(track_id), country, itunes_service)
+    if found is None:
+        return None
+    return AppProfile(name=found["name"], ratings=found["count"],
+                      average=found["average"], released=found["released"])
+
+
+def known_ranks(app, country: str) -> dict[str, int]:
+    """The app's real ranks in one storefront as the Dashboard measured them
+    in the last week, by lowercased keyword: the newest measurement of each
+    keyword tracked for the app, kept only when it found the app ranked.
+
+    The AI Researcher and the AI Competitor tab score a picked app with these,
+    so a keyword the Dashboard tracks scores there as it does on the
+    Dashboard (READINESS_CLARITY_BACKLOG.md, B3). No App Store call.
+    """
+    if app is None or not getattr(app, "pk", None):
+        return {}
+    from .models import SearchResult
+
+    newest: dict[str, int | None] = {}
+    rows = (
+        SearchResult.objects
+        .filter(keyword__app=app, country=(country or "").lower(),
+                searched_at__gte=_now() - KNOWN_RANK_MAX_AGE)
+        .order_by("-searched_at")
+        .values_list("keyword__keyword", "app_rank")
+    )
+    for keyword, rank in rows:
+        key = (keyword or "").strip().lower()
+        if key and key not in newest:
+            newest[key] = rank
+    return {key: rank for key, rank in newest.items() if rank}
+
+
+def scoring_inputs(app, country: str, *, itunes_service) -> tuple[AppProfile | None, dict]:
+    """What a run scores a picked app with: its profile in this storefront
+    (refreshed through one lookup when stale; None for an app without an App
+    Store ID) and its known ranks. (None, {}) when no app is picked. One copy
+    for the web views and the MCP tools."""
+    if app is None:
+        return None, {}
+    profile = (
+        profile_in_storefront(app, country, itunes_service=itunes_service)
+        if app.track_id else None
+    )
+    return profile, known_ranks(app, country)
+
+
+def reclassify(app, country: str) -> int:
+    """Recompute the stored labels of one app's rows in one storefront."""
+    from .models import SearchResult
+    from .scoring import classify_keyword
+
+    changed = []
+    rows = SearchResult.objects.filter(
+        keyword__app=app, country=(country or "").lower(),
+    ).select_related("keyword__app")
+    for row in rows.iterator(chunk_size=200):
+        label = classify_keyword(
+            row.effective_popularity or 0, row.difficulty_score, row.country,
+            app=row.app_profile, app_rank=row.app_rank, keyword=row.keyword_text,
+        )
+        if label != row.classification:
+            row.classification = label
+            changed.append(row)
+    if changed:
+        SearchResult.objects.bulk_update(changed, ["classification"])
+    return len(changed)
+
+
+def backfill_from_history() -> int:
+    """Seed the cache once from what was already observed.
+
+    For every tracked app and storefront with stored rows, the newest row
+    whose competitor list contains the app gives its rating count, average
+    and release date, dated to that row, so the profile is used at once and
+    refreshed at the next scoring. Storefronts where the app never appeared
+    among the top 25 stay unread, and score as a brand new app until the
+    first lookup, which the screen says.
+    """
+    from .models import App, SearchResult
+
+    written = 0
+    for app in App.objects.exclude(track_id__isnull=True):
+        known = dict(app.store_profiles or {})
+        found: dict[str, dict] = {}
+        rows = (
+            SearchResult.objects.filter(keyword__app=app)
+            .order_by("-searched_at")
+            .only("country", "searched_at", "competitors_data")
+        )
+        for row in rows.iterator(chunk_size=200):
+            code = row.country
+            if code in found or code in known:
+                continue
+            for competitor in row.competitors_data or []:
+                if competitor.get("trackId") == app.track_id:
+                    found[code] = {
+                        "count": int(competitor.get("userRatingCount") or 0),
+                        "average": competitor.get("averageUserRating"),
+                        "released": competitor.get("releaseDate"),
+                        "checked_at": row.searched_at.isoformat(),
+                    }
+                    break
+        if found:
+            known.update(found)
+            App.objects.filter(pk=app.pk).update(store_profiles=known)
+            written += len(found)
+    return written

@@ -14,15 +14,20 @@ Design rules (see docs/development/DASHBOARD_APP_SUMMARY_PLAN.md):
 
 from collections import defaultdict
 from datetime import timedelta
+
 from django.utils import timezone
 
 from .models import SearchResult
+from .scoring import estimate_range, sentence_app_name
 
 
 def _safe_estimates(result):
-    """Pull the download-estimates dict off a SearchResult, or return None."""
-    bd = result.difficulty_breakdown or {}
-    est = bd.get("download_estimates")
+    """Download estimates for a SearchResult (effective-popularity based).
+
+    Recomputed from the effective popularity so summary numbers always agree
+    with the popularity column, including right after a source switch.
+    """
+    est = result.effective_download_estimates
     if not est or not est.get("positions"):
         return None
     return est
@@ -94,7 +99,6 @@ def _aggregate_country(results):
     """
     total_low = 0.0
     total_high = 0.0
-    potential_low = 0.0
     potential_high = 0.0
     ranks = []
     in_t20 = 0
@@ -105,10 +109,9 @@ def _aggregate_country(results):
 
     for r in results:
         cur_low, cur_high = _current_dl_interval(r)
-        pot_low, pot_high = _potential_dl_interval(r)
+        _, pot_high = _potential_dl_interval(r)
         total_low += cur_low
         total_high += cur_high
-        potential_low += pot_low
         potential_high += pot_high
 
         if r.app_rank is not None:
@@ -126,28 +129,31 @@ def _aggregate_country(results):
                     "rank": r.app_rank,
                     "downloads_low": cur_low,
                     "downloads_high": cur_high,
-                    "popularity": r.popularity_score,
+                    "popularity": r.effective_popularity,
                 }
 
         # Biggest gap: keyword with the largest potential headroom (downloads at #1
         # minus downloads at current rank). Pure number — no bucket judgment.
         gap = pot_high - cur_high
         # Need either popularity or just a meaningful gap to qualify
-        pop = r.popularity_score
+        pop = r.effective_popularity
         if gap > biggest_gap_score and pop is not None and pop >= 5:
             biggest_gap_score = gap
+            gap_low, gap_high = estimate_range(max(0.0, gap))
             biggest_gap = {
                 "keyword": r.keyword.keyword,
                 "rank": r.app_rank,
                 "popularity": pop,
-                "headroom_low": max(0.0, pot_low - cur_high),
-                "headroom_high": gap,
+                "headroom_low": gap_low,
+                "headroom_high": gap_high,
             }
 
-    # Headroom for the country = potential - current. Clipped to >= 0 to avoid
-    # weird negative ranges when intervals overlap.
-    headroom_low = max(0.0, potential_low - total_high)
-    headroom_high = max(0.0, potential_high - total_low)
+    # Headroom for the country: the estimate at #1 less the estimate now (the
+    # high ends of the two ranges), shown as the same kind of range as every
+    # other download figure, a tenth of it up to it. Subtracting the ends of
+    # two ranges from each other used to clip the low end to zero and print a
+    # lone high figure that read like a precise one.
+    headroom_low, headroom_high = estimate_range(max(0.0, potential_high - total_high))
 
     return {
         "downloads_low": total_low,
@@ -175,7 +181,7 @@ def _bucket_distribution(results):
     """Count keywords per insight classification. No value judgments — diagnostic shape only."""
     dist = defaultdict(int)
     for r in results:
-        dist[r.classification or "Moderate"] += 1
+        dist[r.classification or "Low Volume"] += 1
     return dict(dist)
 
 
@@ -263,16 +269,15 @@ def _build_callouts(country_rows, total_keywords, total_countries, bucket_dist, 
         gap_n = _format_dl_number(biggest_gap_overall["headroom_high"])
         callouts.append(
             f"`{biggest_gap_overall['keyword']}` has the largest rank gap "
-            f"({rank_part}, popularity {biggest_gap_overall['popularity']}) — "
-            f"closing it could add up to ~{gap_n}/day."
+            f"({rank_part}, popularity {biggest_gap_overall['popularity']}). "
+            f"Closing it could add up to ~{gap_n}/day."
         )
 
-    # 3) Single-country prompt — descriptive, not prescriptive
-    if total_countries == 1 and total_keywords >= 5:
-        callouts.append(
-            "You track 1 country. Same keywords in 2–3 storefronts "
-            "often add comparable headroom."
-        )
+    # 3) Single-country prompt, descriptive, not prescriptive. From 20
+    # keywords the "Try new storefronts" card below says the same, so the
+    # line stays out of its way (one concept, one place).
+    if total_countries == 1 and 5 <= total_keywords < 20:
+        callouts.append("You track one country: the same keywords may pay off in other storefronts.")
 
     # 4) House-cleaning — keywords contributing zero downloads
     zero_dl_count = sum(
@@ -282,7 +287,7 @@ def _build_callouts(country_rows, total_keywords, total_countries, bucket_dist, 
     if zero_dl_count >= 5 and len(callouts) < 3:
         callouts.append(
             f"{zero_dl_count} tracked keywords contribute ~0 downloads "
-            f"(not ranking) — consider pruning or running AI Researcher to find replacements."
+            f"(not ranking). Consider pruning them, or run AI Researcher to find replacements."
         )
 
     return callouts[:3]
@@ -300,13 +305,12 @@ def _build_cta(total_keywords, total_countries, country_rows, bucket_dist):
         return {
             "headline": "Expand your keyword coverage",
             "message": (
-                "Most apps need 40–80 keywords to see a representative picture. "
-                "Discover new ones with AI Researcher, or mine your existing "
-                "metadata for missed combinations with AI Simulator."
+                "Most apps need 40-80 keywords for a clear picture. "
+                "Find more with AI Researcher or the Simulator."
             ),
             "buttons": [
-                {"label": "AI Researcher", "url": "ai_researcher", "primary": True},
-                {"label": "AI Simulator", "url": "simulator", "primary": False},
+                {"label": "Find keywords with AI", "url": "ai_researcher", "primary": True},
+                {"label": "Test new metadata", "url": "simulator", "primary": False},
             ],
         }
 
@@ -314,33 +318,28 @@ def _build_cta(total_keywords, total_countries, country_rows, bucket_dist):
         return {
             "headline": "Try new storefronts",
             "message": (
-                "You're tracking one country. AI Researcher's country opportunity "
-                "finder surfaces underserved markets where the same keywords convert."
+                "You track one country. The same keywords can pay off in other "
+                "storefronts too."
             ),
             "buttons": [
-                {"label": "AI Researcher", "url": "ai_researcher", "primary": True},
+                {"label": "Find keywords with AI", "url": "ai_researcher", "primary": True},
             ],
         }
 
     # Flat ranks heuristic — many keywords tracked but most outside Top 50
-    in_t50 = sum(
-        1 for row in country_rows
-        for _ in range(1) if row["ranking_keywords"]  # only meaningful if any rankings
-    )
     deep_count = sum(
         1 for row in country_rows
         if row["total_keywords"] and row["ranking_keywords"] < row["total_keywords"] * 0.4
     )
     if deep_count >= len(country_rows) / 2:
         return {
-            "headline": "Your coverage is wide — try moving the ranks",
+            "headline": "Your coverage is wide: try moving the ranks",
             "message": (
-                "You track plenty of keywords but most aren't ranking. "
-                "AI Simulator lets you test metadata combinations from your "
-                "current title, subtitle and keyword field to find what moves the needle."
+                "You track plenty of keywords, but most aren't ranking. "
+                "Test new metadata in the Simulator to see what moves them."
             ),
             "buttons": [
-                {"label": "AI Simulator", "url": "simulator", "primary": True},
+                {"label": "Test new metadata", "url": "simulator", "primary": True},
             ],
         }
 
@@ -348,45 +347,25 @@ def _build_cta(total_keywords, total_countries, country_rows, bucket_dist):
     return {
         "headline": "Looking solid",
         "message": (
-            "Use AI Simulator to stress-test metadata changes before shipping "
-            "an update — see how new wording would shift your ranks."
+            "Test metadata changes in the Simulator before you ship an update."
         ),
         "buttons": [
-            {"label": "AI Simulator", "url": "simulator", "primary": True},
+            {"label": "Test new metadata", "url": "simulator", "primary": True},
         ],
     }
 
 
 def _format_dl_number(value):
-    """Render a downloads number for the App Summary.
+    """A downloads number for the App Summary, as the History table prints it
+    (aso.scoring.fmt_downloads), so the same value never reads 27 in one
+    panel and 30 in the other. Nothing, or nothing yet, is "0"."""
+    from .scoring import fmt_downloads
 
-    Mirrors ``aso.templatetags.aso_tags._fmt_dl`` (the History table's number
-    formatter) so the same underlying value renders identically in both panels.
-    Without this alignment, a keyword's #1 download estimate showing as ``27``
-    in History would round to ``30`` in the Summary's biggest-opportunity cell
-    and create a confusing visible mismatch.
-
-    Rules (matching ``_fmt_dl``):
-      - >= 1000 → "1.2K" style (one decimal, trailing .0 stripped)
-      - < 1     → one decimal ("0.4")
-      - 1..10   → one decimal, trailing .0 stripped ("7.5", "8")
-      - >= 10   → nearest integer ("27", "109")
-    """
     try:
         n = float(value) if value is not None else 0.0
     except (TypeError, ValueError):
         return "0"
-    if n <= 0:
-        return "0"
-    if n >= 1000:
-        s = f"{n / 1000:.1f}"
-        return (s[:-2] if s.endswith(".0") else s) + "K"
-    if n < 1:
-        return f"{n:.1f}"
-    if n < 10:
-        s = f"{n:.1f}"
-        return s[:-2] if s.endswith(".0") else s
-    return str(round(n))
+    return "0" if n <= 0 else fmt_downloads(n)
 
 
 def format_interval(low, high):
@@ -395,9 +374,11 @@ def format_interval(low, high):
         return "—"
     lo = _format_dl_number(low)
     hi = _format_dl_number(high)
-    if lo == hi or low <= 0:
+    if lo == hi:
         return f"~{hi}"
-    return f"~{lo}–{hi}"
+    # A low end that rounds to nothing is written as 0, never as a lone high
+    # figure, which would read like a precise one.
+    return f"~{'0' if lo == '0.0' else lo}–{hi}"
 
 
 def compute_app_summary(selected_app, selected_app_name, last_refresh=None):
@@ -494,6 +475,7 @@ def compute_app_summary(selected_app, selected_app_name, last_refresh=None):
 
     callouts = _build_callouts(country_rows, total_keywords, total_countries, bucket_dist, results)
     cta = _build_cta(total_keywords, total_countries, country_rows, bucket_dist)
+    glance = _glance(country_rows, is_multi_country)
 
     return {
         "app_name": selected_app_name,
@@ -502,6 +484,9 @@ def compute_app_summary(selected_app, selected_app_name, last_refresh=None):
         "total_keywords": total_keywords,
         "is_multi_country": is_multi_country,
         "headline": headline,
+        # The three tiles at the top of the card (KEYWORDS_PAGE_PLAN.md M2.4)
+        "glance": glance,
+        "app_short_name": sentence_app_name(selected_app_name or ""),
         "country_rows": visible_rows,
         "overflow_count": overflow_count,
         "rank_dist": rank_dist,
@@ -511,4 +496,99 @@ def compute_app_summary(selected_app, selected_app_name, last_refresh=None):
         "last_refresh": last_refresh,
         "callouts": callouts,
         "cta": cta,
+        # Apple Ads impression share (None when the app has no rows -
+        # Apple only reports terms where the app's own ads served, so the
+        # template renders the section only when data exists).
+        "impression_share": _impression_share_summary(selected_app),
     }
+
+
+def _range_words(low, high, more=False):
+    """A downloads range as the glance tiles say it: "0.7 to 7 a day", or
+    "0.7 to 7 more a day"; never "~" or an en dash."""
+    tail = " more a day" if more else " a day"
+    if (low is None or low <= 0) and (high is None or high <= 0):
+        return "Nothing yet"
+    lo = _format_dl_number(low)
+    hi = _format_dl_number(high)
+    if hi in ("0", "0.0"):
+        return f"Under 0.1{tail}"
+    if lo in ("0", "0.0") or lo == hi:
+        return f"Up to {hi}{tail}"
+    return f"{lo} to {hi}{tail}"
+
+
+def _glance(country_rows, is_multi_country):
+    """The glance card's three tiles. With several countries the first two
+    show the country that brings the most today, named under them: the plan
+    of this card never adds storefronts together (DASHBOARD_APP_SUMMARY_PLAN.md,
+    "never sum across countries"). The third is the keyword with the most
+    room above it, anywhere."""
+    if not country_rows:
+        return None
+    lead = country_rows[0]
+    chance = None
+    for row in country_rows:
+        gap = row.get("biggest_gap")
+        if gap and (chance is None or gap["headroom_high"] > chance["headroom_high"]):
+            chance = {**gap, "country": row["country"]}
+    return {
+        "now": _range_words(lead["downloads_low"], lead["downloads_high"]),
+        "more": _range_words(lead["headroom_low"], lead["headroom_high"], more=True),
+        "country": lead["country"] if is_multi_country else "",
+        "chance": chance,
+    }
+
+
+def _impression_share_summary(app_id):
+    """Latest-week impression-share rows for the app, display-ready.
+
+    Returns None when no rows exist (the common case: no ads serving) -
+    no dead UI ever renders for it.
+    """
+    from datetime import timedelta
+
+    from .models import AppleImpressionShare
+
+    latest_week = (
+        AppleImpressionShare.objects.filter(app_id=app_id)
+        .order_by("-week")
+        .values_list("week", flat=True)
+        .first()
+    )
+    if latest_week is None:
+        return None
+    rows = list(
+        AppleImpressionShare.objects.filter(app_id=app_id, week=latest_week)
+        .order_by("-low_share")[:8]
+    )
+    previous = {
+        (r.search_term, r.country): r.low_share
+        for r in AppleImpressionShare.objects.filter(
+            app_id=app_id, week=latest_week - timedelta(days=7)
+        )
+    }
+
+    def share_label(row):
+        if row.high_share == 0:
+            return "under 1%"
+        if row.low_share >= 0.91:
+            return "91-100%"
+        return f"{round(row.low_share * 100)}%"
+
+    display = []
+    for row in rows:
+        prev_share = previous.get((row.search_term, row.country))
+        delta = None
+        if prev_share is not None:
+            moved = round((row.low_share - prev_share) * 100)
+            delta = moved if abs(moved) >= 2 else None
+        display.append({
+            "term": row.search_term,
+            "country": row.country.upper(),
+            "share": share_label(row),
+            "rank": row.rank,
+            "tier": row.popularity_tier,
+            "delta": delta,
+        })
+    return {"week": latest_week, "rows": display}

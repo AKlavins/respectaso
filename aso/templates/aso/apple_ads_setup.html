@@ -1,0 +1,185 @@
+{% extends "aso/base.html" %}
+{% load aso_tags %}
+
+{% block title %}Apple Ads Setup · RespectASO{% endblock %}
+
+{% block content %}
+<div class="max-w-3xl mx-auto">
+    {% include "aso/partials/back_link.html" %}
+
+    <div class="mb-4">
+        <h1 class="page-title mb-1">Connect Apple Ads</h1>
+        <p class="page-lead">
+            A one-time, 5-minute setup that adds Apple's own search popularity. Free, no campaigns or ad spend.
+        </p>
+    </div>
+
+    <!-- Step 1 -->
+    <section class="card p-4 mb-4">
+        <h2 class="card-title mb-2 flex items-center gap-2">
+            <span class="w-6 h-6 rounded-full bg-sky-600/30 text-sky-300 text-xs font-semibold flex items-center justify-center">1</span>
+            Get an Apple Ads account (skip if you have one)
+        </h2>
+        <div class="text-sm text-slate-300 leading-relaxed space-y-2">
+            <p>
+                Go to <a href="https://ads.apple.com" target="_blank" rel="noopener" class="link">ads.apple.com</a>
+                and sign up with your Apple Account. Choose the <span class="text-white font-medium">Advanced</span> plan when asked: it's the
+                free self-service tier, and creating the account costs nothing. You need the
+                <span class="text-white font-medium">Admin</span> role in it (you have it automatically on your own account).
+            </p>
+            <p class="text-xs text-slate-400">
+                You do NOT need to create a campaign or spend anything. The connection only lets RespectASO read
+                Apple's search-popularity data on your behalf.
+            </p>
+        </div>
+    </section>
+
+    <!-- Step 2 -->
+    <section class="card p-4 mb-4">
+        <h2 class="card-title mb-2 flex items-center gap-2">
+            <span class="w-6 h-6 rounded-full bg-sky-600/30 text-sky-300 text-xs font-semibold flex items-center justify-center">2</span>
+            Give your account an API user (one time)
+        </h2>
+        <div class="text-sm text-slate-300 leading-relaxed space-y-2">
+            <p>
+                Apple only shows the API key-upload field to users holding an <span class="text-white font-medium">API role</span>.
+                An Admin login alone sees a different page (the third-party "Manage API Access" list). To get the role:
+            </p>
+            <ol class="list-decimal pl-5 space-y-1.5 text-sm">
+                <li>In the Apple Ads UI, open <span class="text-white">Account Settings → User Management</span> and click
+                    <span class="text-white">Invite Users</span>.</li>
+                <li>Enter a name and an Apple Account email that is not already in this Apple Ads account.
+                    A second email you own works (it must be, or become, an Apple Account).</li>
+                <li>Under User Access and Role, choose <span class="text-white font-medium">API Account Manager</span>.
+                    (With the read-only API role, Apple does not display the key-upload field.)</li>
+                <li>Send the invite, open the email, follow the secure link, and enter the code to activate.</li>
+                <li>Sign in at ads.apple.com as that API user for step 3.</li>
+            </ol>
+        </div>
+    </section>
+
+    <!-- Step 3 -->
+    <section class="card p-4 mb-4">
+        <h2 class="card-title mb-2 flex items-center gap-2">
+            <span class="w-6 h-6 rounded-full bg-sky-600/30 text-sky-300 text-xs font-semibold flex items-center justify-center">3</span>
+            Generate your key in RespectASO and upload it at Apple
+        </h2>
+        <div class="text-sm text-slate-300 leading-relaxed space-y-2">
+            <p>
+                In <a href="{% url 'aso:settings_popularity' %}" class="link">Settings → Apple Ads</a>,
+                click <span class="text-white font-medium">"Generate my key pair"</span>. RespectASO creates a secure key on
+                this computer and shows you the <span class="text-white">public</span> half.
+            </p>
+            <p>
+                Signed in as the API user, open <span class="text-white">Account Settings → API</span> at Apple, paste the
+                public key into the <span class="text-white">Public Key</span> field (including the BEGIN/END lines), and save.
+            </p>
+            <p class="text-xs text-slate-400">
+                The private key stays in your local data folder with owner-only permissions and never leaves this
+                computer. Apple only ever receives the public key and signed requests.
+            </p>
+        </div>
+    </section>
+
+    <!-- Step 4 -->
+    <section class="card p-4 mb-4">
+        <h2 class="card-title mb-2 flex items-center gap-2">
+            <span class="w-6 h-6 rounded-full bg-sky-600/30 text-sky-300 text-xs font-semibold flex items-center justify-center">4</span>
+            Paste the three ids and verify
+        </h2>
+        <div class="text-sm text-slate-300 leading-relaxed space-y-2">
+            <p>
+                After saving, Apple shows three values right above the key field: <span class="text-white font-mono text-xs">clientId</span>,
+                <span class="text-white font-mono text-xs">teamId</span>, and <span class="text-white font-mono text-xs">keyId</span>
+                (Client ID and Team ID are often identical, and that's normal). Paste them into RespectASO and click
+                <span class="text-white font-medium">"Save &amp; verify connection"</span>. RespectASO checks the connection
+                with Apple, asks which ad account to use if you have several, and starts bringing in Apple's
+                data at once.
+            </p>
+            <p>
+                That's it, forever: the key does not expire, weekly data refreshes automatically, and you only ever return
+                here if you rotate or revoke the key at Apple.
+            </p>
+        </div>
+    </section>
+
+    <!-- What to expect -->
+    <section class="card p-4 mb-4">
+        <h2 class="card-title mb-3">What to expect</h2>
+        <ul class="text-sm text-slate-300 space-y-2">
+            <li class="flex gap-2"><span class="text-sky-400">•</span><span>
+                <span class="text-white font-medium">Weekly, automatic:</span> Apple publishes each completed week on
+                Mondays, and RespectASO brings it in while the app is running, with up to 65 weeks of history
+                for keyword trends.
+            </span></li>
+            <li class="flex gap-2"><span class="text-sky-400">•</span><span>
+                <span class="text-white font-medium">Top terms only:</span> Apple reports each category's top 500
+                most-searched terms (roughly 500+ weekly searches). Keywords outside them show the
+                <span class="text-slate-300 font-mono text-xs">EST*</span> badge and score from the calibrated estimate,
+                capped just below their category's reported range, a bound on their popularity, not an error.
+                Hovering the badge explains the exact cap for that keyword.
+            </span></li>
+            <li class="flex gap-2"><span class="text-sky-400">•</span><span>
+                <span class="text-white font-medium">Coverage:</span> {% apple_coverage_sentence %}
+            </span></li>
+            <li class="flex gap-2"><span class="text-sky-400">•</span><span>
+                <span class="text-white font-medium">Extras included:</span> the
+                <a href="{% if pro_edition %}{% url 'aso_pro:top_terms' %}{% else %}{% url 'aso:pro_promo_top_terms' %}{% endif %}" class="link">Top Terms</a> browser
+                (Apple's full ranking, with movers, part of RespectASO Pro), weekly trend arrows on your keywords, and, if you run Apple Ads
+                campaigns, your ads' impression share per search term on the Keywords page.
+            </span></li>
+        </ul>
+    </section>
+
+    <!-- Troubleshooting -->
+    <section class="card p-4 mb-4">
+        <h2 class="card-title mb-3">Troubleshooting</h2>
+        <div class="overflow-x-auto">
+            <table class="w-full text-xs">
+                <thead>
+                    <tr class="text-left text-slate-400 border-b border-white/10">
+                        <th class="py-2 pr-4 font-medium">Symptom</th>
+                        <th class="py-2 font-medium">What it means / what to do</th>
+                    </tr>
+                </thead>
+                <tbody class="text-slate-300">
+                    <tr class="border-b border-white/5">
+                        <td class="py-2.5 pr-4 align-top text-slate-400">"Apple rejected these credentials"</td>
+                        <td class="py-2.5">An id was mistyped, or the public key at Apple doesn't match the one generated here.
+                            Re-check the three values against Account Settings → API, or generate a fresh key pair and re-upload.</td>
+                    </tr>
+                    <tr class="border-b border-white/5">
+                        <td class="py-2.5 pr-4 align-top text-slate-400">"No ad account is visible"</td>
+                        <td class="py-2.5">The API user's role is too limited. Use API Account Manager (step 2).</td>
+                    </tr>
+                    <tr class="border-b border-white/5">
+                        <td class="py-2.5 pr-4 align-top text-slate-400">No Public Key field at Apple</td>
+                        <td class="py-2.5">You are signed in as an Admin without an API role, so the API page only lists
+                            third-party providers. Complete step 2 and sign in as the API user.</td>
+                    </tr>
+                    <tr class="border-b border-white/5">
+                        <td class="py-2.5 pr-4 align-top text-slate-400">Many keywords show EST*</td>
+                        <td class="py-2.5">Expected: most long-tail keywords are below Apple's roughly-500-searches bar.
+                            The Simulator and AI tabs explain this in their results when it affects aggregate scores.</td>
+                    </tr>
+                    <tr class="border-b border-white/5">
+                        <td class="py-2.5 pr-4 align-top text-slate-400">A storefront shows no Apple data</td>
+                        <td class="py-2.5">Apple Ads doesn't operate there (e.g. Russia), or its Apple data has not arrived
+                            yet. It arrives by itself once you track keywords in that storefront.</td>
+                    </tr>
+                    <tr>
+                        <td class="py-2.5 pr-4 align-top text-slate-400">What does Disconnect do?</td>
+                        <td class="py-2.5">Deletes the key from this computer, and no new Apple data arrives. Your scores keep
+                            the Apple data you already have; reconnecting later needs the full setup again (Apple-side key upload included).</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+    </section>
+
+    <a href="{% url 'aso:settings_popularity' %}"
+       class="inline-block text-sm font-medium text-white bg-sky-600 hover:bg-sky-500 rounded-lg px-4 py-2 transition-colors">
+        Back to Apple Ads settings
+    </a>
+</div>
+{% endblock %}

@@ -1,18 +1,72 @@
 from django.urls import path
 
-from . import views
+from . import opportunity_views, settings_views, views
 
 app_name = "aso"
 
 urlpatterns = [
     path("", views.dashboard_view, name="dashboard"),
     path("methodology/", views.methodology_view, name="methodology"),
+    path("whats-new/", views.whats_new_view, name="whats_new"),
+    path("whats-new/seen/", views.whats_new_seen_view, name="whats_new_seen"),
+    path("banner/apple-stale/dismiss/", views.apple_stale_banner_dismiss_view,
+         name="apple_stale_banner_dismiss"),
     path("setup/", views.setup_view, name="setup"),
+    path("setup/apple-ads/", views.apple_ads_setup_view, name="apple_ads_setup"),
+    # Popularity source (free feature): selection + Apple Ads integration
+    path("settings/popularity/", settings_views.settings_popularity_view, name="settings_popularity"),
+    path("settings/mac-app/", settings_views.settings_mac_app_view, name="settings_mac_app"),
+    path("settings/popularity/banner/", settings_views.popularity_banner_view, name="popularity_banner"),
+    path("settings/popularity/keys/generate/", settings_views.apple_keys_generate_view, name="apple_keys_generate"),
+    path("settings/popularity/keys/import/", settings_views.apple_keys_import_view, name="apple_keys_import"),
+    path("settings/popularity/credentials/", settings_views.apple_credentials_view, name="apple_credentials"),
+    path("settings/popularity/verify/", settings_views.apple_verify_view, name="apple_verify"),
+    path("settings/popularity/disconnect/", settings_views.apple_disconnect_view, name="apple_disconnect"),
+    path("settings/popularity/sync-now/", settings_views.apple_sync_now_view, name="apple_sync_now"),
+    path("settings/popularity/sync-status/", settings_views.apple_sync_status_view, name="apple_sync_status"),
     path("search/", views.search_view, name="search"),
-    path("opportunity/", views.opportunity_view, name="opportunity"),
-    path("opportunity/search/", views.opportunity_search_view, name="opportunity_search"),
-    path("opportunity/search-country/", views.opportunity_search_country_view, name="opportunity_search_country"),
-    path("opportunity/save/", views.opportunity_save_view, name="opportunity_save"),
+    # Keyword search jobs (aso/search_jobs.py): the dashboard panel and the global strip
+    path("search/jobs/current/", views.search_job_current_view, name="search_job_current"),
+    path("search/jobs/<int:job_id>/", views.search_job_detail_view, name="search_job_detail"),
+    path("search/jobs/<int:job_id>/pause/", views.search_job_pause_view, name="search_job_pause"),
+    path("search/jobs/<int:job_id>/resume/", views.search_job_resume_view, name="search_job_resume"),
+    path("search/jobs/<int:job_id>/discard/", views.search_job_discard_view, name="search_job_discard"),
+    path("search/jobs/<int:job_id>/retry-failed/", views.search_job_retry_failed_view, name="search_job_retry_failed"),
+    path("search/jobs/<int:job_id>/dismiss/", views.search_job_dismiss_view, name="search_job_dismiss"),
+    path("keywords/cleanup/snooze/", views.keyword_cleanup_snooze_view, name="keyword_cleanup_snooze"),
+    path("settings/time-zone/", views.time_zone_view, name="time_zone"),
+    # The run queue (Pro): shared by the AI tabs and the dashboard
+    path("queue/", views.queue_status_view, name="queue_status"),
+    path("queue/remove/", views.queue_remove_view, name="queue_remove"),
+    path("queue/clear/", views.queue_clear_view, name="queue_clear"),
+    path("queue/move/", views.queue_move_view, name="queue_move"),
+    path("queue/run-now/", views.queue_run_now_view, name="queue_run_now"),
+    # The Country Opportunity Finder. The scan is a queued background job
+    # (aso/opportunity_scans.py), so these mirror the keyword search endpoints
+    # one for one rather than scanning inside a request.
+    path("opportunity/", opportunity_views.opportunity_view, name="opportunity"),
+    path("opportunity/start/", opportunity_views.opportunity_start_view,
+         name="opportunity_start"),
+    path("opportunity/scans/current/", opportunity_views.opportunity_current_view,
+         name="opportunity_current"),
+    path("opportunity/scans/<int:scan_id>/", opportunity_views.opportunity_detail_view,
+         name="opportunity_detail"),
+    path("opportunity/scans/<int:scan_id>/country/<str:code>/",
+         opportunity_views.opportunity_country_view, name="opportunity_country"),
+    path("opportunity/scans/<int:scan_id>/pause/", opportunity_views.opportunity_pause_view,
+         name="opportunity_pause"),
+    path("opportunity/scans/<int:scan_id>/resume/", opportunity_views.opportunity_resume_view,
+         name="opportunity_resume"),
+    path("opportunity/scans/<int:scan_id>/discard/", opportunity_views.opportunity_discard_view,
+         name="opportunity_discard"),
+    path("opportunity/scans/<int:scan_id>/retry-failed/",
+         opportunity_views.opportunity_retry_failed_view, name="opportunity_retry_failed"),
+    path("opportunity/scans/<int:scan_id>/dismiss/", opportunity_views.opportunity_dismiss_view,
+         name="opportunity_dismiss"),
+    path("opportunity/save/", opportunity_views.opportunity_save_view, name="opportunity_save"),
+
+    # The global bottom strip, whichever job type is running.
+    path("jobs/strip/", opportunity_views.job_strip_state_view, name="job_strip_state"),
     path("export/history.csv", views.export_history_csv_view, name="export_history_csv"),
     path("apps/", views.apps_view, name="apps"),
     path("apps/lookup/", views.app_lookup_view, name="app_lookup"),
@@ -22,6 +76,11 @@ urlpatterns = [
     path("results/<int:result_id>/delete/", views.result_delete_view, name="result_delete"),
     path("results/bulk-delete/", views.results_bulk_delete_view, name="results_bulk_delete"),
     path("keywords/bulk-delete/", views.keywords_bulk_delete_view, name="keywords_bulk_delete"),
+    path("history/selection/", views.history_selection_view, name="history_selection"),
+    path("ui-memory/", views.ui_memory_view, name="ui_memory"),
+    path("keywords/labels/", views.keyword_labels_of_view, name="keyword_labels_of"),
+    path("keywords/labels/add/", views.keyword_labels_add_view, name="keyword_labels_add"),
+    path("keywords/labels/remove/", views.keyword_labels_remove_view, name="keyword_labels_remove"),
     path("keywords/<int:keyword_id>/refresh/", views.keyword_refresh_view, name="keyword_refresh"),
     path("keywords/bulk-refresh/", views.keywords_bulk_refresh_view, name="keywords_bulk_refresh"),
     path("auto-refresh/status/", views.auto_refresh_status_view, name="auto_refresh_status"),
@@ -32,4 +91,6 @@ urlpatterns = [
     path("pro/ai-researcher/", views.pro_promo_researcher_view, name="pro_promo_researcher"),
     path("pro/ai-competitor/", views.pro_promo_competitor_view, name="pro_promo_competitor"),
     path("pro/simulator/", views.pro_promo_simulator_view, name="pro_promo_simulator"),
+    path("pro/top-terms/", views.pro_promo_top_terms_view, name="pro_promo_top_terms"),
+    path("pro/rival-tracker/", views.pro_promo_rival_tracker_view, name="pro_promo_rival_tracker"),
 ]

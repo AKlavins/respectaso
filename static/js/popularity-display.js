@@ -1,0 +1,424 @@
+/**
+ * popularity-display.js - the ONE client-side renderer for dual-source
+ * popularity cells.
+ *
+ * Server-side counterpart: {% popularity_cell %} in aso/templatetags/aso_tags.py.
+ * The two MUST stay visually identical (guarded by test_scoring_consistency).
+ *
+ * Every payload rendered here carries:
+ *   popularity            - the effective value (feeds all calculations)
+ *   popularity_internal   - RespectASO estimate
+ *   popularity_apple      - Apple Ads value (null when Apple has none)
+ *   popularity_source     - "internal" | "apple" (source of `popularity`)
+ *   popularity_fallback   - true when Apple is selected but had no value
+ *   popularity_cap        - fallback rows: the cap applied to the estimate
+ *                           (genre floor - 1); null when the storefront has
+ *                           no Apple dataset (the estimate stands uncapped)
+ *   popularity_genre      - fallback rows: display label of the category
+ *                           the cap came from ("" when uninferred)
+ *
+ * Layout: ONE number per cell - the effective value plus a source badge
+ * (EST / ASA / EST* fallback). Everything else lives in the badge's hover
+ * popover: what the source is, the other source's value for comparison,
+ * and on fallback rows the full cap story with the row's own numbers
+ * (raw estimate, cap, category floor) - the cap is explained, never
+ * hidden, but no longer competes with the score in the table.
+ * Rows from sessions stored before the cap fields existed degrade to a
+ * generic fallback explanation.
+ */
+(function (global) {
+    'use strict';
+
+    var BADGES = {
+        est: {
+            cls: 'bg-slate-700/40 text-slate-300 border border-white/10',
+            label: 'EST',
+        },
+        asa: {
+            cls: 'bg-sky-900/40 text-sky-300 border border-sky-500/30',
+            label: 'ASA',
+        },
+        // Deliberately as quiet as EST: fallback is the NORMAL case for
+        // long-tail keywords under the Apple source, not a warning. Blue
+        // ASA is the scannable "official value" signal.
+        fallback: {
+            cls: 'bg-slate-700/40 text-slate-300 border border-white/10',
+            label: 'EST*',
+        },
+    };
+
+    function esc(value) {
+        return value === null || value === undefined ? '—' : String(value);
+    }
+
+    /**
+     * Badge + popover content for a scored row. Returns
+     * {badge, heading, paragraphs, note} - `note` is the muted footer line
+     * (the other source's value for comparison, when one exists).
+     */
+    function resolveTip(row) {
+        var internal = ('popularity_internal' in row) ? row.popularity_internal : row.popularity;
+        var apple = ('popularity_apple' in row) ? row.popularity_apple : null;
+        var source = row.popularity_source || 'internal';
+        var appleConfigured = !!global.APPLE_POP_CONFIGURED;
+        var hasInternal = internal !== null && internal !== undefined;
+
+        if (row.popularity_fallback) {
+            if (!('popularity_cap' in row)) {
+                // Row stored before the cap fields existed.
+                return {
+                    badge: BADGES.fallback,
+                    heading: 'Not in Apple\'s top terms',
+                    paragraphs: [
+                        'This keyword is outside Apple\'s published top search terms '
+                        + 'for this storefront, so RespectASO\'s estimate powers the '
+                        + 'score, calibrated to the same 1-100 scale as Apple\'s values.',
+                    ],
+                    note: '',
+                };
+            }
+            var cap = row.popularity_cap;
+            if (cap === null || cap === undefined) {
+                return {
+                    badge: BADGES.fallback,
+                    heading: 'No Apple data for this storefront',
+                    paragraphs: [
+                        'Apple publishes no search-popularity data for this '
+                        + 'storefront, so RespectASO\'s estimate powers the score directly.',
+                    ],
+                    note: '',
+                };
+            }
+            var where = row.popularity_genre
+                ? 'the ' + row.popularity_genre + ' category' : 'its category';
+            var absentPara = 'This keyword is not among Apple\'s most-searched terms for '
+                + where + ' here this week.';
+            if (hasInternal && internal > cap) {
+                return {
+                    badge: BADGES.fallback,
+                    heading: 'Not in Apple\'s top terms: capped',
+                    paragraphs: [
+                        absentPara,
+                        'RespectASO\'s estimate of ' + internal + ' is scored as ' + cap
+                        + ', below Apple\'s lowest reported value there (' + (cap + 1) + ').',
+                    ],
+                    note: '',
+                };
+            }
+            return {
+                badge: BADGES.fallback,
+                heading: 'Not in Apple\'s top terms',
+                paragraphs: [
+                    absentPara,
+                    'RespectASO\'s estimate' + (hasInternal ? ' (' + internal + ')' : '')
+                    + ' already sits below Apple\'s lowest reported value there ('
+                    + (cap + 1) + '), so it powers the score unchanged.',
+                ],
+                note: '',
+            };
+        }
+        if (source === 'apple') {
+            return {
+                badge: BADGES.asa,
+                heading: 'Apple Ads popularity',
+                paragraphs: [
+                    'Apple\'s official search popularity for this storefront, '
+                    + 'updated weekly: the active source powering your scores.',
+                ],
+                note: hasInternal ? 'RespectASO estimate for comparison: ' + internal : '',
+            };
+        }
+        var note = '';
+        if (apple !== null && apple !== undefined) {
+            note = 'Apple\'s official value for comparison: ' + apple;
+        } else if (appleConfigured) {
+            note = 'Not among Apple\'s top terms in this storefront: Apple reports no value.';
+        }
+        return {
+            badge: BADGES.est,
+            heading: 'RespectASO estimate',
+            paragraphs: [
+                'RespectASO\'s own estimate, calibrated to Apple\'s official '
+                + '1-100 popularity scale, the active source powering your scores.',
+            ],
+            note: note,
+        };
+    }
+
+    /**
+     * Source badge with its hover popover. `idx`/`total` flip the popover
+     * below for top-half rows (avoids clipping against the table header)
+     * and above otherwise - same rule as formatDownloadCell.
+     */
+    function badgeHtml(tip, idx, total, triggerHtml) {
+        var showBelow = total > 0 && idx < total / 2;
+        var pos = showBelow ? 'top-full mt-2' : 'bottom-full mb-2';
+        return '<span class="group/pop relative inline-flex">'
+            + (triggerHtml || ('<span class="text-2xs font-semibold uppercase tracking-wide rounded px-0.5 py-px '
+                + tip.badge.cls + ' cursor-help">' + tip.badge.label + '</span>'))
+            + '<div class="hidden group-hover/pop:block absolute z-20 ' + pos
+            + ' left-1/2 -translate-x-1/2 w-64 bg-slate-800 border border-white/10 rounded-lg p-3 '
+            + 'shadow-xl text-left normal-case font-normal tracking-normal whitespace-normal">'
+            + '<p class="text-2xs text-slate-400 mb-1.5 font-medium uppercase tracking-wider">'
+            + tip.heading + '</p>'
+            + tip.paragraphs.map(function (p, i) {
+                return '<p class="text-2xs leading-relaxed text-slate-300'
+                    + (i ? ' mt-1.5' : '') + '">' + p + '</p>';
+            }).join('')
+            + (tip.note
+                ? '<p class="text-2xs leading-relaxed text-slate-400 mt-2 pt-1.5 border-t border-white/5">'
+                    + tip.note + '</p>'
+                : '')
+            + '</div></span>';
+    }
+
+    // Minimum Apple week-over-week popularity move that renders a trend
+    // arrow. MUST match APPLE_TREND_MIN_DELTA in aso_tags.py (twin rule).
+    var APPLE_TREND_MIN_DELTA = 3;
+
+    function trendHtml(row) {
+        var delta = row.popularity_apple_trend;
+        if (typeof delta !== 'number' || Math.abs(delta) < APPLE_TREND_MIN_DELTA) return '';
+        var arrow = delta > 0 ? '▲' : '▼';
+        var tone = delta > 0 ? 'text-emerald-400' : 'text-red-400';
+        var signed = (delta > 0 ? '+' : '') + delta;
+        return '<span class="text-2xs ' + tone + ' cursor-help" '
+            + 'title="Apple popularity vs previous week: ' + signed + '">' + arrow + '</span>';
+    }
+
+    /**
+     * Standard centered popularity cell: effective value + source badge
+     * with its explanatory popover. `extraHtml` appends inline content.
+     * Pass `idx`/`total` (0-based row index, row count) so the popover
+     * flips away from the nearest table edge.
+     */
+    // A row from the source the column header names needs no badge: the
+    // number itself opens the popover (KEYWORDS_PAGE_PLAN.md M1.5). Only a
+    // row that differs (EST*, or the other source) keeps its badge.
+    function isPlain(tip) {
+        var active = global.POPULARITY_SOURCE === 'apple' ? 'apple' : 'internal';
+        return (tip.badge === BADGES.asa && active === 'apple')
+            || (tip.badge === BADGES.est && active === 'internal');
+    }
+
+    function formatPopularityCell(row, extraHtml, idx, total) {
+        var tip = resolveTip(row);
+        var number = '<span class="text-sm font-semibold text-purple-400' + (isPlain(tip) ? ' cursor-help' : '') + '">'
+            + esc(row.popularity) + '</span>';
+        return '<div class="leading-tight inline-block text-center">'
+            + '<span class="inline-flex items-center justify-center gap-1.5">'
+            + (isPlain(tip) ? badgeHtml(tip, idx || 0, total || 0, number)
+                            : number + badgeHtml(tip, idx || 0, total || 0))
+            + trendHtml(row)
+            + (extraHtml || '')
+            + '</span>'
+            + '</div>';
+    }
+
+    /**
+     * Chip-style variant for the AI tab tables: wraps the tab's existing
+     * color-coded chip HTML with the source badge + popover, keeping each
+     * tab's chip styling.
+     */
+    function formatPopularityChipCell(row, chipHtml) {
+        var tip = resolveTip(row);
+        return '<div class="leading-tight inline-block text-center">'
+            + '<span class="inline-flex items-center justify-center gap-1">'
+            + (isPlain(tip) ? badgeHtml(tip, 0, 0, '<span class="cursor-help">' + chipHtml + '</span>')
+                            : chipHtml + badgeHtml(tip, 0, 0))
+            + '</span>'
+            + '</div>';
+    }
+
+    /**
+     * Standalone source badge (with popover) for big-number layouts where
+     * the value is rendered by the caller - e.g. the Opportunity detail
+     * panel's "50 / 100" block.
+     */
+    function formatPopularityBadge(row) {
+        return badgeHtml(resolveTip(row), 0, 0);
+    }
+
+    /**
+     * Run-level source note for stored AI analyses. Reports are frozen
+     * snapshots: their numbers keep matching the AI's written analysis, so
+     * instead of retroactively changing them, the report STATES which
+     * popularity source produced it - and flags when that differs from the
+     * user's current selection (new and refined runs use the current one).
+     */
+    function formatRunSourceNote(rows) {
+        if (!rows || !rows.length) return '';
+        var usedApple = rows.some(function (r) {
+            return r && (r.popularity_source === 'apple' || r.popularity_fallback);
+        });
+        var used = usedApple ? 'apple' : 'internal';
+        var label = usedApple ? 'Apple Ads popularity' : 'RespectASO estimate';
+        var current = global.POPULARITY_SOURCE || 'internal';
+        var html = '<span class="text-slate-400">Popularity source used in this analysis:</span> '
+            + '<span class="text-slate-300 font-medium">' + label + '</span>';
+        if (current !== used) {
+            var currentLabel = current === 'apple' ? 'Apple Ads popularity' : 'the RespectASO estimate';
+            html += ' <span class="ml-1.5 text-2xs text-amber-300/90 bg-amber-900/25 border border-amber-500/25 rounded px-1.5 py-px">'
+                + 'differs from your current selection. New runs use ' + currentLabel + '</span>';
+        }
+        return '<p class="text-xs mb-2">' + html + '</p>';
+    }
+
+    /**
+     * Tiny standalone source badge for saved-run list items: which
+     * popularity source a stored analysis used ('apple' | 'internal').
+     * Same visual language as the table badges; '' for unknown/running.
+     */
+    function formatRunSourceBadge(source) {
+        if (source !== 'apple' && source !== 'internal') return '';
+        var badge = source === 'apple' ? BADGES.asa : BADGES.est;
+        var label = source === 'apple' ? 'Apple Ads popularity' : 'RespectASO estimate';
+        return '<span class="text-2xs font-semibold uppercase tracking-wide rounded px-0.5 py-px '
+            + badge.cls + ' cursor-help" title="Popularity source used in this analysis: '
+            + label + '">' + badge.label + '</span>';
+    }
+
+    /**
+     * Keeps the badge popovers of cells drawn inside a scrolling box (a
+     * dialog's list) in view: a popover opens below its badge in the box's
+     * upper half and above it in the lower half, wherever the box is
+     * scrolled to. `idx`/`total` cannot know that for a list taller than
+     * its box.
+     */
+    function keepPopoversIn(box) {
+        if (!box) return;
+        box.addEventListener('mouseover', function (e) {
+            var holder = e.target instanceof Element ? e.target.closest('.group\\/pop') : null;
+            var popover = holder && box.contains(holder) ? holder.querySelector('div') : null;
+            if (!popover) return;
+            var badge = holder.getBoundingClientRect();
+            var area = box.getBoundingClientRect();
+            var below = badge.top + badge.height / 2 < area.top + area.height / 2;
+            popover.classList.toggle('top-full', below);
+            popover.classList.toggle('mt-2', below);
+            popover.classList.toggle('bottom-full', !below);
+            popover.classList.toggle('mb-2', !below);
+        });
+    }
+
+    /** Compact single-line variant for tickers and tight layouts: "48 ASA". */
+    function formatPopularityCompact(row) {
+        var source = row.popularity_source || 'internal';
+        var badge = row.popularity_fallback
+            ? BADGES.fallback
+            : (source === 'apple' ? BADGES.asa : BADGES.est);
+        return esc(row.popularity) + ' ' + badge.label;
+    }
+
+    // ── Source-context advisory ─────────────────────────────────────────
+    // Data-driven Overview callout explaining when the OTHER popularity
+    // source would paint a different picture. Symmetric: ASA runs explain
+    // below-threshold coverage (Apple only publishes its top search terms,
+    // roughly 500+ weekly searches); EST runs warn about sharp divergence
+    // from available Apple data. States only observable facts - never why
+    // Apple reports what it does, and never that either source is truth.
+    var ADVISORY_MIN_ROWS = 5;       // both triggers: minimum affected keywords
+    var FALLBACK_SHARE = 0.5;        // ASA runs: share of rows below Apple's bar
+    var DIVERGENCE_POINTS = 30;      // EST runs: |apple - internal| threshold
+    var DIVERGENCE_SHARE = 0.3;      // EST runs: share of dual-value rows diverging
+
+    function advisoryHtml(paragraphs) {
+        return '<div class="mb-4 rounded-xl border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-sm text-amber-200">'
+            + paragraphs.map(function (p, i) {
+                return '<p class="text-xs leading-relaxed text-amber-100/90' + (i ? ' mt-2' : '') + '">' + p + '</p>';
+            }).join('')
+            + '</div>';
+    }
+
+    function altReadinessSentence(opts, label) {
+        if (!opts || typeof opts.altReadiness !== 'number') return '';
+        return 'Scored with ' + label + ' instead, this metadata would rate roughly '
+            + '<strong class="text-amber-100">' + Math.round(opts.altReadiness) + '/100</strong>. '
+            + 'Neither figure is more true: they measure differently.';
+    }
+
+    /**
+     * Returns advisory HTML for a stored run's rows, or '' when there is
+     * nothing worth saying. opts (Simulator only): {altReadiness, altSource}
+     * - the frozen other-source readiness computed at run time.
+     */
+    function formatSourceContextAdvisory(rows, opts) {
+        if (!rows || !rows.length) return '';
+        var usedApple = rows.some(function (r) {
+            return r && (r.popularity_source === 'apple' || r.popularity_fallback);
+        });
+
+        if (usedApple) {
+            var fallbackRows = rows.filter(function (r) { return r && r.popularity_fallback; });
+            if (fallbackRows.length < ADVISORY_MIN_ROWS
+                || fallbackRows.length / rows.length < FALLBACK_SHARE) return '';
+            var paras = [
+                '<strong class="text-amber-100">' + fallbackRows.length + ' of the ' + rows.length
+                    + ' keywords in this analysis are outside Apple\'s published top '
+                    + 'terms,</strong> so they use RespectASO\'s estimate on the same 1-100 scale.',
+                'A modest score here can reflect Apple\'s reporting bar rather than weak metadata.',
+            ];
+            var altA = altReadinessSentence(opts, 'the RespectASO estimate');
+            if (altA) paras.push(altA);
+            paras.push('To use the estimate instead, switch the source in Settings before the next run.');
+            return advisoryHtml(paras);
+        }
+
+        var dualRows = rows.filter(function (r) {
+            return r && typeof r.popularity_apple === 'number' && typeof r.popularity_internal === 'number';
+        });
+        var divergent = dualRows.filter(function (r) {
+            return Math.abs(r.popularity_apple - r.popularity_internal) >= DIVERGENCE_POINTS;
+        });
+        if (divergent.length < ADVISORY_MIN_ROWS
+            || divergent.length / dualRows.length < DIVERGENCE_SHARE) return '';
+        var parasB = [
+            '<strong class="text-amber-100">Apple Ads reports quite different popularity for '
+                + divergent.length + ' of the ' + dualRows.length
+                + ' keywords with Apple data in this analysis.</strong> '
+                + 'Hover a source badge to see both values, and check those keywords by hand.',
+        ];
+        var altB = altReadinessSentence(opts, 'Apple Ads popularity');
+        if (altB) parasB.push(altB);
+        parasB.push('To use Apple Ads popularity instead, switch the source in Settings before the next run.');
+        return advisoryHtml(parasB);
+    }
+
+
+    // ── Country coverage advisory ───────────────────────────────────────
+    // What a set of results across many storefronts does not say for itself.
+    // Sibling of formatSourceContextAdvisory above, same markup, same rule:
+    // observable facts only, counted from the rows on screen rather than from
+    // any static list, so the sentence cannot drift from what is shown.
+    function formatCoverageAdvisory(rows) {
+        if (!rows || rows.length < 2) { return ''; }
+        var noApple = 0;
+        var derivedMarket = 0;
+        rows.forEach(function (row) {
+            // A fallback row with no cap is the "Apple reports nothing for
+            // this storefront at all" case (aso/popularity.py absent_cap).
+            if (row.popularity_fallback && !row.popularity_cap) { noApple += 1; }
+            if (row.market_source === 'derived') { derivedMarket += 1; }
+        });
+        var paragraphs = [];
+        if (noApple) {
+            paragraphs.push('Apple reports no search popularity in ' + noApple + ' of these '
+                + 'storefronts, so their score is RespectASO\'s estimate.');
+        }
+        if (derivedMarket) {
+            paragraphs.push('Download estimates in ' + derivedMarket + ' of these markets use a '
+                + 'derived market size, so treat those ranges as indicative.');
+        }
+        return paragraphs.length ? advisoryHtml(paragraphs) : '';
+    }
+
+    global.formatPopularityCell = formatPopularityCell;
+    global.formatRunSourceNote = formatRunSourceNote;
+    global.formatRunSourceBadge = formatRunSourceBadge;
+    global.formatPopularityChipCell = formatPopularityChipCell;
+    global.formatPopularityBadge = formatPopularityBadge;
+    global.formatPopularityCompact = formatPopularityCompact;
+    global.keepPopoversIn = keepPopoversIn;
+    global.formatSourceContextAdvisory = formatSourceContextAdvisory;
+    global.formatCoverageAdvisory = formatCoverageAdvisory;
+})(window);
